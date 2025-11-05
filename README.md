@@ -36,7 +36,7 @@ Twitch Game Changer is a lightweight, smart desktop application for Windows that
 
 1.  Go to the **[Releases Page](https://github.com/your-username/your-repo/releases)**.
 2.  Download the latest `TwitchGameChanger_vX.X.X.exe`.
-3.  Place the `.exe` in a folder (e.g., `C:\Program Files\TwitchGameChanger`) and run it.
+3.   run The Installer and Enjoy The App ❤️.
 
 ### Option 2: From Source (For Developers)
 
