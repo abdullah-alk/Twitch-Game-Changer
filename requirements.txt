@@ -3,3 +3,4 @@ psutil
 pystray
 cryptography
 Pillow
+pyinstaller
