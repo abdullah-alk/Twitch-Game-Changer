@@ -1,0 +1,171 @@
+name: Build and Sign TwitchGameChanger
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'  # Triggers on version tags like v1.0.0
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+# Required permissions for GitHub Attestations
+permissions:
+  contents: write          # Create releases
+  id-token: write         # Create attestations
+  attestations: write     # Create attestations
+
+jobs:
+  build-windows:
+    name: Build Windows Executable with Attestation
+    runs-on: windows-latest
+    
+    steps:
+      # Step 1: Checkout repository
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      # Step 2: Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      # Step 3: Install dependencies
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pip install requests
+          pip install pystray
+          pip install pillow
+          pip install cryptography
+      
+      # Step 4: Verify icon file exists (optional - create placeholder if missing)
+      - name: Check for icon file
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "icon.ico")) {
+            Write-Host "Warning: icon.ico not found. Creating a placeholder..."
+            # You can add icon.ico to your repo or remove this step if you have it
+          } else {
+            Write-Host "icon.ico found successfully"
+          }
+      
+      # Step 5: Build the executable
+      - name: Build TwitchGameChanger.exe
+        run: |
+          pyinstaller --onefile --windowed --name TwitchGameChanger --icon=icon.ico TwitchGameChanger.py
+        continue-on-error: false
+      
+      # Step 6: Verify build output
+      - name: Verify executable was created
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/TwitchGameChanger.exe") {
+            $size = (Get-Item "dist/TwitchGameChanger.exe").Length / 1MB
+            Write-Host "✅ Build successful! Size: $([math]::Round($size, 2)) MB"
+            Get-Item "dist/TwitchGameChanger.exe" | Select-Object Name, Length, CreationTime
+          } else {
+            Write-Error "Build failed: TwitchGameChanger.exe not found"
+            exit 1
+          }
+      
+      # Step 7: 🔐 Generate GitHub Attestation (THE SIGNING STEP!)
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'dist/TwitchGameChanger.exe'
+      
+      # Step 8: Create SHA256 checksum
+      - name: Generate checksum
+        shell: pwsh
+        run: |
+          cd dist
+          $hash = Get-FileHash -Algorithm SHA256 TwitchGameChanger.exe
+          $hash.Hash + "  TwitchGameChanger.exe" | Out-File -Encoding ASCII SHA256SUMS.txt
+          Write-Host "Generated SHA256: $($hash.Hash)"
+          Get-Content SHA256SUMS.txt
+      
+      # Step 9: Attest the checksum file too
+      - name: Attest checksum file
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: 'dist/SHA256SUMS.txt'
+      
+      # Step 10: Upload artifacts for download
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TwitchGameChanger-Windows
+          path: |
+            dist/TwitchGameChanger.exe
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+      
+      # Step 11: Create GitHub Release
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/TwitchGameChanger.exe
+            dist/SHA256SUMS.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 🎮 TwitchGameChanger ${{ github.ref_name }}
+            
+            ### Installation
+            1. Download `TwitchGameChanger.exe`
+            2. Run the executable
+            3. Configure your Twitch settings
+            
+            ### ✅ Verification (Recommended)
+            This release is signed with GitHub Artifact Attestations. To verify authenticity:
+            
+            ```bash
+            # Install GitHub CLI if not already installed
+            winget install --id GitHub.cli
+            
+            # Verify the download
+            gh attestation verify TwitchGameChanger.exe --repo ${{ github.repository }}
+            ```
+            
+            ### 📋 Checksum Verification
+            You can also verify file integrity using the SHA256 checksum:
+            ```powershell
+            # Windows PowerShell
+            $hash = Get-FileHash -Algorithm SHA256 TwitchGameChanger.exe
+            Get-Content SHA256SUMS.txt
+            # Compare the hashes manually
+            ```
+            
+            ### 🔐 Security
+            - ✅ Signed with cryptographic attestation
+            - ✅ Verifiable build provenance
+            - ✅ Built from source via GitHub Actions
+            
+            ---
+            **Full Changelog**: https://github.com/${{ github.repository }}/compare/...
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Step 12: Post-build summary
+      - name: Build Summary
+        shell: pwsh
+        run: |
+          Write-Host "================================================"
+          Write-Host "✅ BUILD AND SIGNING COMPLETE!"
+          Write-Host "================================================"
+          Write-Host ""
+          Write-Host "📦 Artifact: TwitchGameChanger.exe"
+          Write-Host "🔐 Attestation: Created and linked to release"
+          Write-Host "📍 Release: ${{ github.ref_name }}"
+          Write-Host ""
+          Write-Host "Users can verify with:"
+          Write-Host "  gh attestation verify TwitchGameChanger.exe --repo ${{ github.repository }}"
+          Write-Host ""
