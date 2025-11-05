@@ -30,16 +30,6 @@ Twitch Game Changer is a lightweight, smart desktop application for Windows that
 * **Resilient Tray Icon:** The system tray icon is designed to automatically recover and reload if Windows Explorer restarts (a common issue that crashes many tray apps).
 * **Run on Startup:** Includes a `--startup` launch flag so you can add it to your Windows startup folder and have it run minimized automatically.
 
----
-
-## 📸 Screenshots
-
-| Main Library | Twitch Settings | Excluded Games |
-| :---: | :---: | :---: |
-|  |  |  |
-
----
-
 ## 🚀 Installation
 
 ### Option 1: From Release (Recommended)
@@ -100,17 +90,3 @@ If you have Python 3.10+ installed, you can run the app from the source code.
 5.  **Start Monitoring:** Click the **`⚪ Monitor`** button. It will turn green and read **`🟢 Active`**.
 6.  **Minimize:** Close the window. The app will automatically minimize to your system tray.
 7.  **All Done!** Just launch any game from your library, and your Twitch category will update within seconds.
-
-### Adding to Windows Startup
-
-Want the app to launch and monitor automatically when you turn on your computer?
-
-1.  Find your app's `.exe` (or create a shortcut to it).
-2.  Right-click the executable/shortcut and select **Properties**.
-3.  In the **Target** field, add ` --startup` to the very end (note the space before the dashes).
-    * **Example:** `"C:\Program Files\TwitchGameChanger\TwitchGameChanger.exe" --startup`
-4.  Press `Win + R` to open the Run dialog.
-5.  Type `shell:startup` and press Enter. This will open your user's Startup folder.
-6.  Paste the **shortcut** (not the original .exe) into this folder.
-
-Now, the app will launch silently and minimize directly to the tray every time you log in.
