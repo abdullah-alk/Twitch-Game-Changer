@@ -1,4 +1,3 @@
-# TwitchGameChanger - Optimized & Secured
 import os
 import json
 import winreg
