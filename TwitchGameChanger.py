@@ -1,4 +1,4 @@
-# TwitchGameChanger.py  (modified: unified tray icon, tray recovery, removed console spam)
+# TwitchGameChanger.py  (modified: persistent tray, no icons, no paths)
 import os
 import json
 import winreg
@@ -34,8 +34,7 @@ APP_DATA_DIR.mkdir(exist_ok=True)
 TWITCH_CONFIG_FILE = APP_DATA_DIR / 'twitch_config.json'
 EXCLUDED_GAMES_FILE = APP_DATA_DIR / 'excluded_games.json'
 GAMES_CACHE_FILE = APP_DATA_DIR / 'games_cache.json'
-ICON_CACHE_DIR = APP_DATA_DIR / 'icons'
-ICON_CACHE_DIR.mkdir(exist_ok=True)
+# --- ICON_CACHE_DIR removed ---
 
 # ---------- Token Encryption ----------
 class TokenEncryption:
@@ -84,46 +83,17 @@ class TokenEncryption:
                 # Backward compatibility - return plaintext if decryption fails
                 return data
 
-# ---------- Icon Extraction ----------
-class IconExtractor:
-    """Extract and cache game icons from executables"""
-    @staticmethod
-    def extract_icon(exe_path: str, game_name: str):
-        icon_path = ICON_CACHE_DIR / f"{hashlib.md5(game_name.encode()).hexdigest()}.png"
-        if icon_path.exists(): 
-            return str(icon_path)
-        try:
-            from PIL import Image
-            import win32api, win32con, win32ui, win32gui
-            ico_x = win32api.GetSystemMetrics(win32con.SM_CXICON)
-            large, small = win32gui.ExtractIconEx(exe_path, 0)
-            if not large: 
-                return None
-            hdc = win32ui.CreateDCFromHandle(win32gui.GetDC(0))
-            hbmp = win32ui.CreateBitmap()
-            hbmp.CreateCompatibleBitmap(hdc, ico_x, ico_x)
-            hdc_mem = hdc.CreateCompatibleDC()
-            hdc_mem.SelectObject(hbmp)
-            win32gui.DrawIconEx(hdc_mem.GetHandleOutput(), 0, 0, large[0], ico_x, ico_x, 0, 0, win32con.DI_NORMAL) # type: ignore
-            bmpinfo = hbmp.GetInfo()
-            bmpstr = hbmp.GetBitmapBits(True)
-            img = Image.frombuffer('RGB', (bmpinfo['bmWidth'], bmpinfo['bmHeight']), bmpstr, 'raw', 'BGRX', 0, 1)
-            img.save(icon_path, 'PNG')
-            win32gui.DestroyIcon(large[0])
-            for i in small: 
-                win32gui.DestroyIcon(i)
-            return str(icon_path)
-        except: 
-            return None
+# ---------- IconExtractor Class Removed ----------
 
 # ---------- Data class ----------
 class Game:
-    def __init__(self, name: str, path: str, platform: str, exe_path: str = "", icon: str = ""):
+    # --- 'icon' attribute removed from init ---
+    def __init__(self, name: str, path: str, platform: str, exe_path: str = ""):
         self.name = name
         self.path = path
         self.platform = platform
         self.exe_path = exe_path if exe_path else path
-        self.icon = icon
+        # --- self.icon removed ---
 
 # ---------- Twitch integration ----------
 class TwitchBot:
@@ -167,6 +137,12 @@ class TwitchBot:
         if self.user_id:
             self.config['user_id'] = self.user_id
         self.save_config()
+    
+    def is_authenticated(self) -> bool:
+        """Check if user is authenticated with valid token and enabled"""
+        return (self.access_token is not None and 
+                self.config.get('enabled', False) and 
+                self.config.get('channel_name', '') != '')
 
     def authenticate(self) -> bool:
         """Device flow with refresh token storage."""
@@ -404,6 +380,14 @@ class TwitchBot:
 
 # ---------- Scanner ----------
 class GameScanner:
+    # Applications that should NEVER be included in scans
+    PERMANENT_EXCLUSIONS = {
+        'Steamworks Common Redistributables',
+        'Wallpaper Engine',
+        'wallpaper engine',  # case variation
+        'Steamworks Common Redistributables',  # exact match
+    }
+    
     def __init__(self):
         self.excluded = self.load_excluded()
 
@@ -438,18 +422,21 @@ class GameScanner:
         return sorted(list(self.excluded))
 
     def is_excluded(self, name: str) -> bool:
+        # Check if in permanent exclusions (case-insensitive)
+        name_lower = name.lower()
+        for perm_exclusion in self.PERMANENT_EXCLUSIONS:
+            if name_lower == perm_exclusion.lower():
+                return True
+        # Check user exclusions
         return name in self.excluded
 
     def get_drives(self) -> List[str]:
         import string
         return [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
 
-    # (scanning methods kept unchanged - long function bodies omitted here for brevity)
-    # We'll keep your original implementations for scan_steam(), scan_epic(), scan_gog(), scan_ea(), scan_riot(), scan_battlenet(), scan_xbox(), scan_all()
-    # For brevity in this view I won't repeat them, but keep them identical to your uploaded file.
+    # --- Scanning methods modified to remove icon extraction ---
 
     def scan_steam(self) -> List[Game]:
-        # same body as your original implementation
         games = []
         try:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam")
@@ -494,17 +481,13 @@ class GameScanner:
                                                             break
                                                     if not exe_found:
                                                         try:
-                                                            # Skip obvious non-game executables
                                                             skip_patterns = ['unins', 'install', 'setup', 'crash', 'report', 'redist', 'dotnet', 'directx', 'vcredist', 'unity', 'unreal']
-                                                            
                                                             exes_root = [e for e in gpath.glob("*.exe") 
                                                                         if not any(skip in e.stem.lower() for skip in skip_patterns)]
                                                             if exes_root:
-                                                                # Prefer executables with "game" or the install dir name
                                                                 game_exes = [e for e in exes_root if 'game' in e.stem.lower() or installdir.lower() in e.stem.lower()]
                                                                 exe_found = game_exes[0] if game_exes else exes_root[0]
                                                             else:
-                                                                # Look in subdirectories
                                                                 for root, dirs, files in os.walk(gpath):
                                                                     depth = root[len(str(gpath)):].count(os.sep)
                                                                     if depth > 3:
@@ -513,15 +496,13 @@ class GameScanner:
                                                                     exe_files = [f for f in files if f.endswith('.exe') 
                                                                                 and not any(skip in f.lower() for skip in skip_patterns)]
                                                                     if exe_files:
-                                                                        # Prefer main game executables
                                                                         game_exes = [f for f in exe_files if 'game' in f.lower() or installdir.lower() in f.lower()]
                                                                         exe_found = Path(root) / (game_exes[0] if game_exes else exe_files[0])
                                                                         break
                                                         except Exception:
                                                             pass
-                                                    # Extract icon
-                                                    icon = IconExtractor.extract_icon(str(exe_found), name) if exe_found else ""
-                                                    games.append(Game(name, str(gpath), "Steam", str(exe_found) if exe_found else "", icon)) # type: ignore
+                                                    # --- Icon extraction removed ---
+                                                    games.append(Game(name, str(gpath), "Steam", str(exe_found) if exe_found else ""))
                                     except Exception:
                                         continue
         except Exception:
@@ -539,16 +520,14 @@ class GameScanner:
                         name = data.get('DisplayName')
                         location = data.get('InstallLocation')
                         if name and location and Path(location).exists() and not self.is_excluded(name):
-                            # Find exe
                             gpath = Path(location)
                             exe_found = None
                             for exe in gpath.glob("*.exe"):
                                 if not any(skip in exe.stem.lower() for skip in ['unins', 'install', 'setup', 'crash']):
                                     exe_found = exe
                                     break
-                            # Extract icon
-                            icon = IconExtractor.extract_icon(str(exe_found), name) if exe_found else ""
-                            games.append(Game(name, location, "Epic Games", str(exe_found) if exe_found else "", icon)) # type: ignore
+                            # --- Icon extraction removed ---
+                            games.append(Game(name, location, "Epic Games", str(exe_found) if exe_found else ""))
                 except Exception:
                     continue
         return games
@@ -567,8 +546,8 @@ class GameScanner:
                     winreg.CloseKey(subkey)
                     if Path(path).exists() and not self.is_excluded(name):
                         exe_path = str(Path(path) / exe)
-                        icon = IconExtractor.extract_icon(exe_path, name) if Path(exe_path).exists() else ""
-                        games.append(Game(name, path, "GOG", exe_path, icon)) # type: ignore # type: ignore
+                        # --- Icon extraction removed ---
+                        games.append(Game(name, path, "GOG", exe_path))
                     i += 1
                 except OSError:
                     break
@@ -589,15 +568,14 @@ class GameScanner:
                                 if 'dipinstallpath' in f.read().lower():
                                     name = folder.name
                                     if not self.is_excluded(name):
-                                        # Find exe and extract icon
                                         exe_found = None
                                         for exe in folder.glob("*.exe"):
                                             if not any(skip in exe.stem.lower() for skip in ['unins', 'install', 'setup']):
                                                 exe_found = exe
                                                 break
-                                        icon = IconExtractor.extract_icon(str(exe_found), name) if exe_found else ""
-                                        games.append(Game(name, str(folder), "EA/Origin", str(exe_found) if exe_found else "", icon)) # type: ignore
-                                    break
+                                        # --- Icon extraction removed ---
+                                        games.append(Game(name, str(folder), "EA/Origin", str(exe_found) if exe_found else ""))
+                                        break
                         except Exception:
                             continue
         return games
@@ -617,14 +595,13 @@ class GameScanner:
                             exes = list(folder.rglob("*.exe"))
                             if exes and not self.is_excluded(folder.name):
                                 if not any(g.name == folder.name for g in games):
-                                    # Find exe and extract icon
                                     exe_found = None
                                     for exe in folder.glob("*.exe"):
                                         if not any(skip in exe.stem.lower() for skip in ['unins', 'install', 'setup']):
                                             exe_found = exe
                                             break
-                                    icon = IconExtractor.extract_icon(str(exe_found), folder.name) if exe_found else ""
-                                    games.append(Game(folder.name, str(folder), "Riot Games", str(exe_found) if exe_found else "", icon)) # type: ignore
+                                    # --- Icon extraction removed ---
+                                    games.append(Game(folder.name, str(folder), "Riot Games", str(exe_found) if exe_found else ""))
         return games
 
     def scan_battlenet(self) -> List[Game]:
@@ -666,8 +643,8 @@ class GameScanner:
                                         pass
                                 if exe_found and not self.is_excluded(game_info["name"]):
                                     if not any(g.name == game_info["name"] for g in games):
-                                        icon = IconExtractor.extract_icon(str(exe_found), game_info["name"]) if exe_found else ""
-                                        games.append(Game(game_info["name"], str(item), "Battle.net", str(exe_found), icon)) # type: ignore
+                                        # --- Icon extraction removed ---
+                                        games.append(Game(game_info["name"], str(item), "Battle.net", str(exe_found)))
                                         break
             except Exception:
                 pass
@@ -696,8 +673,8 @@ class GameScanner:
                         exes = list(content_folder.glob("*.exe"))
                         if exes and not self.is_excluded(game_name):
                             if not any(g.name == game_name for g in games):
-                                icon = IconExtractor.extract_icon(str(exes[0]), game_name)
-                                games.append(Game(game_name, str(content_folder), "Xbox", str(exes[0]), icon)) # type: ignore
+                                # --- Icon extraction removed ---
+                                games.append(Game(game_name, str(content_folder), "Xbox", str(exes[0])))
         return games
 
     def scan_all(self) -> List[Game]:
@@ -828,9 +805,10 @@ class GUI:
         self.root = root
         self.root.title("Twitch Game Changer")
 
-        # Tray and icon state
+        # --- Tray logic moved to be persistent ---
         self.tray_icon = None
-        self.is_minimized_to_tray = False
+        self.is_minimized_to_tray = False # Flag to know if window is hidden
+        self.app_is_closing = False      # Flag to control tray thread exit
 
         # Icon set up (window icon)
         try:
@@ -854,7 +832,9 @@ class GUI:
 
         # Close behavior
         if TRAY_AVAILABLE:
-            self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)  # always minimize-to-tray when available
+            self.root.protocol("WM_DELETE_WINDOW", self.minimize_to_tray)
+            # --- Start the persistent tray icon on launch ---
+            self.start_persistent_tray()
         else:
             self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
@@ -867,6 +847,8 @@ class GUI:
 
         self.setup_ui()
         self.root.after(1400, self.load_cache)
+        # Auto-start monitor if Twitch is authenticated (after cache loads)
+        self.root.after(1600, self.auto_start_monitor)
 
     def setup_ui(self):
         # UI kept identical to your original implementation (unchanged)
@@ -952,19 +934,40 @@ class GUI:
         self.filtered = self.games.copy()
         self.status.config(text=f"✅ Found {len(self.games)} games across all platforms", fg="#10b981")
         self.display()
+        # Auto-start monitor after scan if Twitch is authenticated
+        self.root.after(500, self.auto_start_monitor)
 
     def filter(self):
-        search = self.search_var.get().lower()
+        search = self.search_var.get().lower().strip()
         platform = self.platform_var.get()
+        
+        # If no games loaded yet, show a helpful message
+        if not self.games:
+            self.status.config(text="⚠️ No games loaded - please scan first!", fg="#f59e0b")
+            self.filtered = []
+            self.display()
+            return
+        
+        # Apply filters
         self.filtered = [g for g in self.games if search in g.name.lower() and (platform == "All Platforms" or g.platform == platform)]
+        
+        # Update status with search results
+        if search or platform != "All Platforms":
+            total = len(self.games)
+            found = len(self.filtered)
+            if found == 0:
+                self.status.config(text=f"🔍 No games match your search (0/{total})", fg="#f59e0b")
+            else:
+                self.status.config(text=f"🔍 Showing {found} of {total} games", fg="#60a5fa")
+        else:
+            self.status.config(text=f"✅ Showing all {len(self.games)} games", fg="#10b981")
+        
         self.display()
 
     def display(self):
         for w in self.games_frame.winfo_children():
             w.destroy()
-        if not hasattr(self, 'game_images'):
-            self.game_images = {}
-        self.game_images.clear()
+        # --- self.game_images removed ---
         gc.collect()
         
         if not self.filtered:
@@ -983,27 +986,19 @@ class GUI:
             accent = tk.Frame(card_frame, bg=colors.get(game.platform, "#4b5563"), width=5)
             accent.pack(side="left", fill="y")
             
-            # Add icon if available
-            if game.icon and os.path.exists(game.icon):
-                try:
-                    from PIL import Image, ImageTk
-                    img = Image.open(game.icon).resize((40, 40), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS) # type: ignore
-                    photo = ImageTk.PhotoImage(img)
-                    self.game_images[game.name] = photo
-                    icon_label = tk.Label(card_frame, image=photo, bg="#151b2e")
-                    icon_label.pack(side="left", padx=12, pady=12)
-                except:
-                    pass
+            # --- Icon display logic completely removed ---
             
             content = tk.Frame(card_frame, bg="#151b2e")
+            # --- Added padx=20 to 'content' frame to replace spacing from deleted icon ---
             content.pack(side="left", fill="both", expand=True, padx=20, pady=16)
             tk.Label(content, text=game.name, font=("Segoe UI", 13, "bold"), bg="#151b2e", fg="#f3f4f6", anchor="w").pack(anchor="w")
             details = tk.Frame(content, bg="#151b2e")
             details.pack(anchor="w", pady=(6, 0))
             badge = tk.Label(details, text=game.platform, font=("Segoe UI", 8, "bold"), bg=colors.get(game.platform, "#4b5563"), fg="#ffffff", padx=10, pady=3)
             badge.pack(side="left", padx=(0, 12))
-            path_text = game.path if len(game.path) <= 70 else game.path[:67] + "..."
-            tk.Label(details, text=f"📁 {path_text}", font=("Segoe UI", 9), bg="#151b2e", fg="#6b7280").pack(side="left")
+            
+            # --- Game destination path (path_text) label removed ---
+            
             remove_btn = tk.Button(card_frame, text="✕", command=lambda g=game: self.remove(g), font=("Segoe UI", 12, "bold"), bg="#ef4444", fg="#ffffff", activebackground="#dc2626", relief="flat", padx=16, pady=8, cursor="hand2", borderwidth=0)
             remove_btn.pack(side="right", padx=16, pady=12)
 
@@ -1030,6 +1025,27 @@ class GUI:
             self.monitor.start()
             self.monitor_btn.config(text="🟢 Active", bg="#ef4444")
             self.status.config(text="🔴 Monitoring active - detecting game launches", fg="#10b981")
+    
+    def auto_start_monitor(self):
+        """Automatically start monitor if Twitch is authenticated and games are loaded"""
+        # Only auto-start if:
+        # 1. Twitch is authenticated and enabled
+        # 2. Games have been loaded (from cache or scan)
+        # 3. Monitor is not already running
+        if self.twitch.is_authenticated() and self.games and not (self.monitor and self.monitor.active):
+            try:
+                self.monitor = GameMonitor(self.games, self.twitch, self.update_status)
+                self.monitor.start()
+                self.monitor_btn.config(text="🟢 Active", bg="#ef4444")
+                
+                # Show different message based on startup mode
+                if STARTUP_MODE:
+                    self.status.config(text="✅ Auto-monitoring started (Twitch authenticated)", fg="#10b981")
+                else:
+                    self.status.config(text="✅ Auto-monitoring started - Twitch is ready!", fg="#10b981")
+            except Exception as e:
+                # Silently fail if auto-start doesn't work
+                pass
 
     def update_status(self, text, color):
         self.root.after(0, lambda: self.status.config(text=text, fg=color))
@@ -1123,7 +1139,8 @@ class GUI:
 
     def save_cache(self):
         try:
-            data = [{'name': g.name, 'path': g.path, 'platform': g.platform, 'exe_path': g.exe_path, 'icon': g.icon} for g in self.games]
+            # --- 'icon' field removed from cache data ---
+            data = [{'name': g.name, 'path': g.path, 'platform': g.platform, 'exe_path': g.exe_path} for g in self.games]
             with open(GAMES_CACHE_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception:
@@ -1134,7 +1151,8 @@ class GUI:
             if GAMES_CACHE_FILE.exists():
                 with open(GAMES_CACHE_FILE, 'r') as f:
                     data = json.load(f)
-                    self.games = [Game(g['name'], g['path'], g['platform'], g.get('exe_path', ''), g.get('icon', '')) for g in data]
+                    # --- 'icon' field removed from cache loading ---
+                    self.games = [Game(g['name'], g['path'], g['platform'], g.get('exe_path', '')) for g in data]
                     self.filtered = self.games.copy()
                     if self.games:
                         self.display()
@@ -1142,7 +1160,7 @@ class GUI:
         except Exception:
             pass
 
-    # ---------- tray / icon ----------
+    # ---------- tray / icon (MODIFIED FOR PERSISTENT TRAY) ----------
     def create_tray_icon_image(self):
         """Always use the real icon.ico for the tray icon."""
         try:
@@ -1159,74 +1177,56 @@ class GUI:
         except Exception:
             return None
 
-    def minimize_to_tray(self):
-        # Called when window is closed or minimized (WM_DELETE_WINDOW)
-        if not TRAY_AVAILABLE or pystray is None:
-            self.root.iconify()
+    def start_persistent_tray(self):
+        """Creates and runs the persistent tray icon in a thread."""
+        if not TRAY_AVAILABLE or pystray is None or item is None:
             return
 
-        if self.is_minimized_to_tray:
-            return
+        image = self.create_tray_icon_image()
+        menu = pystray.Menu(
+            item('Show', self.show_window, default=True),
+            item('Monitor Status', self.show_monitor_status),
+            pystray.Menu.SEPARATOR,
+            item('Exit', self.quit_app)
+        )
+        
+        try:
+            self.tray_icon = pystray.Icon("twitch_game_changer", image, "Twitch Game Changer", menu)
+        except Exception:
+            self.tray_icon = pystray.Icon("twitch_game_changer", None, "Twitch Game Changer", menu)
 
-        # Hide window
-        self.root.withdraw()
-        self.is_minimized_to_tray = True
-
-        # Create tray icon if not exists or not visible
-        if not self.tray_icon:
-            image = self.create_tray_icon_image()
-            if item is None or pystray is None:
-                return
-
-            menu = pystray.Menu(
-                item('Show', self.show_window, default=True),
-                item('Monitor Status', self.show_monitor_status),
-                pystray.Menu.SEPARATOR,
-                item('Exit', self.quit_app)
-            )
-
-            # Create Icon object and run it inside a resilient thread
-            try:
-                self.tray_icon = pystray.Icon("twitch_game_changer", image, "Twitch Game Changer", menu)
-            except Exception:
-                self.tray_icon = pystray.Icon("twitch_game_changer", None, "Twitch Game Changer", menu)
-
-            def start_tray_loop():
-                # keep trying to run the tray icon; if run() exits due to Explorer restart, recreate & rerun
-                while self.is_minimized_to_tray:
-                    try:
-                        # run will block until stop(); if system explorer restarts it may raise/exit
-                        self.tray_icon.run() # type: ignore
-                        # if run returns normally (stop called), break
+        def start_tray_loop():
+            # keep trying to run the tray icon; if run() exits due to Explorer restart, recreate & rerun
+            while not self.app_is_closing:
+                try:
+                    # run will block until stop(); if system explorer restarts it may raise/exit
+                    self.tray_icon.run() # type: ignore
+                    # if run returns normally (stop called), break
+                    break
+                except Exception:
+                    # short pause and recreate the icon object if app is not closing
+                    time.sleep(1.0)
+                    if self.app_is_closing:
                         break
+                    try:
+                        image2 = self.create_tray_icon_image()
+                        self.tray_icon = pystray.Icon("twitch_game_changer", image2, "Twitch Game Changer", menu) # type: ignore
                     except Exception:
-                        # short pause and recreate the icon object if still minimized
+                        # if recreation fails, sleep and retry
                         time.sleep(1.0)
-                        if not self.is_minimized_to_tray:
-                            break
-                        try:
-                            image2 = self.create_tray_icon_image()
-                            self.tray_icon = pystray.Icon("twitch_game_changer", image2, "Twitch Game Changer", menu) # type: ignore
-                        except Exception:
-                            # if recreation fails, sleep and retry
-                            time.sleep(1.0)
-                            continue
+                        continue
 
-            threading.Thread(target=start_tray_loop, daemon=True).start()
+        threading.Thread(target=start_tray_loop, daemon=True).start()
+
+    def minimize_to_tray(self):
+        """Hides the window. Called by WM_DELETE_WINDOW."""
+        self.is_minimized_to_tray = True
+        self.root.withdraw()
 
     def show_window(self, icon=None, item=None):
-        # Restore window, stop tray icon
+        """Shows the window. Called by tray icon menu."""
         self.is_minimized_to_tray = False
-        try:
-            if self.tray_icon:
-                try:
-                    self.tray_icon.stop()
-                except Exception:
-                    pass
-                # clear reference so new icon can be created later
-                self.tray_icon = None
-        except Exception:
-            pass
+        # --- No longer stops the icon ---
         self.root.after(0, self.root.deiconify)
         self.root.after(0, self.root.lift)
         self.root.after(0, self.root.focus_force)
@@ -1241,24 +1241,25 @@ class GUI:
         self.root.after(0, show_msg)
 
     def quit_app(self, icon=None, item=None):
-        # Clean exit
+        """Cleanly exits the entire application."""
+        self.app_is_closing = True # Signal tray thread to exit
+        
         try:
             if self.monitor and self.monitor.active:
                 self.monitor.stop()
         except Exception:
             pass
+        
         try:
             if self.tray_icon:
-                try:
-                    self.tray_icon.stop()
-                except Exception:
-                    pass
-                self.tray_icon = None
+                self.tray_icon.stop()
         except Exception:
             pass
+        
         self.root.after(0, self.root.destroy)
 
     def on_closing(self):
+        """Fallback for non-tray systems, or if tray fails."""
         if self.monitor and self.monitor.active:
             if messagebox.askyesno("Monitor Active", "Game monitor is active. Exit anyway?\n\nThis will stop tracking your games."):
                 self.monitor.stop()
@@ -1273,6 +1274,7 @@ def main():
 
     # minimize on startup only if flagged
     if STARTUP_MODE and hasattr(app, "minimize_to_tray"):
+        # The tray icon is already running, so just hide the window
         root.after(800, app.minimize_to_tray)
 
     root.mainloop()
