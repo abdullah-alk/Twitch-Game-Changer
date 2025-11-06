@@ -4,7 +4,7 @@
 
 Twitch Game Changer is a lightweight, smart desktop application for Windows that scans your PC for installed games, monitors your active processes, and instantly updates your Twitch category when you launch a game. When you close it, it intelligently switches you back to "Just Chatting."
 
-**[Instagram For Feedback!]([https://github.com/abdullah-alk/Twitch-Game-Changer/releases](https://www.instagram.com/m84t1/))**
+**[Instagram For Feedback!](https://www.instagram.com/m84t1/)**
 
 ---
 
