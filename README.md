@@ -76,5 +76,20 @@ If you have Python 3.10+ installed, you can run the app from the source code.
 
 ## 💡 How to Use
 
-* Step 1: Click on Release Page on the installation
+* Step 1: Click on Release Page on the installation.
   ![](images/step1.png)
+
+* Step 2: Download The Lastest version on the Release Page.
+  ![](images/step2.png)
+
+* Step 3: After installing the app, Click on the twitch icon to add your account.
+ ![](images/step3.png)
+
+* Step 4: Add your twitch username, then check the box and click authorize.
+ ![](images/step4.png)
+
+* Step 5: Click on scan to reveal all the games in your pc.
+  ![App Screenshot](images/step5.png)
+
+* Step 6: Enjoy the app, if the game isn't from a famous platform other than EA, add the game manually and make sure the monitor is active.
+ ![App Screenshot](images/step6.png)
