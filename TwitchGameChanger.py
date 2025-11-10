@@ -1,4 +1,3 @@
-# TwitchGameChanger.py  (modified: persistent tray, no icons, no paths)
 import os
 import json
 import winreg
@@ -14,6 +13,12 @@ import sys
 import gc
 import base64
 import hashlib
+
+# App version and update settings
+APP_VERSION = "1.0.3"  # Update this when releasing new versions
+GITHUB_REPO = "abdullah-alk/Twitch-Game-Changer"  # Change to your actual GitHub repo
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_CHECK_FILE = None  # Will be set after APP_DATA_DIR is created
 
 # Optional modules (lazy/light usage)
 try:
@@ -34,6 +39,7 @@ APP_DATA_DIR.mkdir(exist_ok=True)
 TWITCH_CONFIG_FILE = APP_DATA_DIR / 'twitch_config.json'
 EXCLUDED_GAMES_FILE = APP_DATA_DIR / 'excluded_games.json'
 GAMES_CACHE_FILE = APP_DATA_DIR / 'games_cache.json'
+UPDATE_CHECK_FILE = APP_DATA_DIR / 'last_update_check.json'
 # --- ICON_CACHE_DIR removed ---
 
 # ---------- Token Encryption ----------
@@ -82,6 +88,201 @@ class TokenEncryption:
             except:
                 # Backward compatibility - return plaintext if decryption fails
                 return data
+
+# ---------- Auto Updater ----------
+class AutoUpdater:
+    """Handles automatic updates from GitHub releases"""
+    
+    def __init__(self, current_version: str, repo: str, api_url: str):
+        self.current_version = current_version
+        self.repo = repo
+        self.api_url = api_url
+        self.last_check_file = UPDATE_CHECK_FILE
+    
+    @staticmethod
+    def parse_version(version_str: str) -> tuple:
+        """Parse version string like '1.0.0' or 'v1.0.0' into tuple (1, 0, 0)"""
+        try:
+            # Remove 'v' prefix if present
+            version_str = version_str.lstrip('v')
+            # Handle versions like "1.0" or "1.0.0"
+            parts = version_str.split('.')
+            while len(parts) < 3:
+                parts.append('0')
+            return tuple(map(int, parts[:3]))
+        except:
+            return (0, 0, 0)
+    
+    def should_check_for_updates(self) -> bool:
+        """Check if enough time has passed since last update check (24 hours)"""
+        try:
+            if not self.last_check_file.exists(): # type: ignore
+                return True
+            
+            with open(self.last_check_file, 'r') as f: # type: ignore
+                data = json.load(f)
+                last_check = data.get('last_check', 0)
+                # Check every 24 hours
+                return (time.time() - last_check) > 60
+        except:
+            return True
+    
+    def save_last_check(self):
+        """Save the timestamp of the last update check"""
+        try:
+            with open(self.last_check_file, 'w') as f: # type: ignore
+                json.dump({'last_check': time.time()}, f)
+        except:
+            pass
+    
+    def check_for_updates(self) -> dict:
+        """
+        Check GitHub for new releases
+        Returns: dict with 'available', 'version', 'download_url', 'release_notes'
+        """
+        try:
+            import requests
+            response = requests.get(self.api_url, timeout=10)
+            
+            if response.status_code != 200:
+                return {'available': False, 'error': 'Failed to check for updates'}
+            
+            release_data = response.json()
+            latest_version = release_data.get('tag_name', '').lstrip('v')
+            
+            # Compare versions
+            current = self.parse_version(self.current_version)
+            latest = self.parse_version(latest_version)
+            
+            if latest > current:
+                # Find the installer .exe asset
+                download_url = None
+                file_size = 0
+                for asset in release_data.get('assets', []):
+                    name_lower = asset['name'].lower()
+                    # Look for the installer exe (TwitchGameChangerInstaller.exe or similar)
+                    if 'installer' in name_lower and name_lower.endswith('.exe'):
+                        download_url = asset['browser_download_url']
+                        file_size = asset.get('size', 0)
+                        break
+                
+                if not download_url:
+                    # Fallback: look for any .exe
+                    for asset in release_data.get('assets', []):
+                        if asset['name'].endswith('.exe'):
+                            download_url = asset['browser_download_url']
+                            file_size = asset.get('size', 0)
+                            break
+                
+                return {
+                    'available': True,
+                    'version': latest_version,
+                    'download_url': download_url,
+                    'file_size': file_size,
+                    'release_notes': release_data.get('body', 'No release notes available.'),
+                    'html_url': release_data.get('html_url', '')
+                }
+            
+            return {'available': False}
+        
+        except Exception as e:
+            return {'available': False, 'error': str(e)}
+    
+    def download_and_install_update(self, download_url: str, callback=None) -> bool:
+        """
+        Download the installer and run it
+        Returns: True if successful, False otherwise
+        """
+        try:
+            import requests
+            
+            if callback:
+                callback("Downloading installer...")
+            
+            # Download the installer
+            response = requests.get(download_url, stream=True, timeout=60)
+            
+            if response.status_code != 200:
+                if callback:
+                    callback("Failed to download installer")
+                return False
+            
+            # Save installer to temp location
+            installer_path = APP_DATA_DIR / "TwitchGameChangerInstaller_Update.exe"
+            
+            # Download with progress
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(installer_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if callback and total_size > 0:
+                            progress = int((downloaded / total_size) * 100)
+                            callback(f"Downloading... {progress}%")
+            
+            if callback:
+                callback("Starting installer...")
+            
+            # Run the installer silently with /SILENT flag (Inno Setup)
+            # /CLOSEAPPLICATIONS will close the current instance
+            # /RESTARTAPPLICATIONS will restart after install
+            subprocess.Popen([
+                str(installer_path),
+                '/SILENT',
+                '/CLOSEAPPLICATIONS',
+                '/RESTARTAPPLICATIONS'
+            ])
+            
+            # Give installer a moment to start
+            time.sleep(1)
+            
+            return True
+            
+        except Exception as e:
+            if callback:
+                callback(f"Update failed: {str(e)}")
+            return False
+    
+    def download_installer_for_manual_install(self, download_url: str, callback=None) -> str:
+        """
+        Download installer for manual installation
+        Returns: Path to downloaded installer or None
+        """
+        try:
+            import requests
+            
+            if callback:
+                callback("Downloading installer...")
+            
+            response = requests.get(download_url, stream=True, timeout=60)
+            
+            if response.status_code != 200:
+                return None # type: ignore
+            
+            installer_path = APP_DATA_DIR / "TwitchGameChangerInstaller_Update.exe"
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(installer_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if callback and total_size > 0:
+                            progress = int((downloaded / total_size) * 100)
+                            callback(f"Downloading... {progress}%")
+            
+            if callback:
+                callback("Download complete!")
+            
+            return str(installer_path)
+            
+        except Exception:
+            return None # type: ignore
 
 # ---------- IconExtractor Class Removed ----------
 
@@ -160,7 +361,7 @@ class TwitchBot:
             data = r.json()
             user_code, device_code = data['user_code'], data['device_code']
             verify_url = data.get('verification_uri', 'https://www.twitch.tv/activate')
-            expires_in = data.get('expires_in', 600)
+            expires_in = data.get('expires_in', 1800)  # Increased to 30 minutes (1800 seconds)
             interval = data.get('interval', 5)
 
             webbrowser.open(verify_url)
@@ -465,23 +666,59 @@ class GameScanner:
                                                 gpath = steamapps / "common" / installdir
                                                 if gpath.exists():
                                                     exe_found = None
-                                                    common_exes = [
-                                                        gpath / f"{installdir}.exe",
-                                                        gpath / f"{name}.exe",
-                                                        gpath / "bin" / f"{installdir}.exe",
-                                                        gpath / "Binaries" / "Win64" / f"{installdir}.exe",
-                                                        gpath / "Binaries" / "Win64" / f"{name}.exe",
-                                                        gpath / f"{installdir}-Win64-Shipping.exe",
-                                                        gpath / "Game" / f"{installdir}.exe",
-                                                        gpath / "Client" / f"{installdir}.exe",
-                                                    ]
-                                                    for exe_path in common_exes:
-                                                        if exe_path.exists():
-                                                            exe_found = exe_path
-                                                            break
+                                                    
+                                                    # Special handling for Marvel Rivals on Steam
+                                                    if "marvel rivals" in name.lower():
+                                                        marvel_exes = [
+                                                            gpath / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                                                            gpath / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                                                            gpath / "MarvelRivals-Win64-Shipping.exe",
+                                                        ]
+                                                        for marvel_exe in marvel_exes:
+                                                            if marvel_exe.exists():
+                                                                exe_found = marvel_exe
+                                                                break
+                                                        
+                                                        # If still not found, do a deep search for Marvel Rivals specifically
+                                                        if not exe_found:
+                                                            try:
+                                                                for root, dirs, files in os.walk(gpath):
+                                                                    depth = root[len(str(gpath)):].count(os.sep)
+                                                                    if depth > 5:
+                                                                        dirs.clear()
+                                                                        continue
+                                                                    for file in files:
+                                                                        if file.lower() in ['marvelrivals-win64-shipping.exe', 'marvelrivals.exe']:
+                                                                            exe_found = Path(root) / file
+                                                                            break
+                                                                    if exe_found:
+                                                                        break
+                                                            except Exception:
+                                                                pass
+                                                    
+                                                    # Standard exe detection if not found yet (for non-Marvel games or as fallback)
+                                                    if not exe_found:
+                                                        common_exes = [
+                                                            gpath / f"{installdir}.exe",
+                                                            gpath / f"{name}.exe",
+                                                            gpath / "bin" / f"{installdir}.exe",
+                                                            gpath / "Binaries" / "Win64" / f"{installdir}.exe",
+                                                            gpath / "Binaries" / "Win64" / f"{name}.exe",
+                                                            gpath / f"{installdir}-Win64-Shipping.exe",
+                                                            gpath / "Game" / f"{installdir}.exe",
+                                                            gpath / "Client" / f"{installdir}.exe",
+                                                        ]
+                                                        for exe_path in common_exes:
+                                                            if exe_path.exists():
+                                                                exe_found = exe_path
+                                                                break
                                                     if not exe_found:
                                                         try:
                                                             skip_patterns = ['unins', 'install', 'setup', 'crash', 'report', 'redist', 'dotnet', 'directx', 'vcredist', 'unity', 'unreal']
+                                                            # Don't skip 'launcher' for Marvel Rivals since we need SOMETHING
+                                                            if "marvel rivals" not in name.lower():
+                                                                skip_patterns.append('launcher')
+                                                            
                                                             exes_root = [e for e in gpath.glob("*.exe") 
                                                                         if not any(skip in e.stem.lower() for skip in skip_patterns)]
                                                             if exes_root:
@@ -522,10 +759,77 @@ class GameScanner:
                         if name and location and Path(location).exists() and not self.is_excluded(name):
                             gpath = Path(location)
                             exe_found = None
-                            for exe in gpath.glob("*.exe"):
-                                if not any(skip in exe.stem.lower() for skip in ['unins', 'install', 'setup', 'crash']):
-                                    exe_found = exe
-                                    break
+                            
+                            # Special handling for Marvel Rivals on Epic
+                            if "marvel rivals" in name.lower():
+                                marvel_exes = [
+                                    gpath / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                                    gpath / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                                    gpath / "MarvelRivals-Win64-Shipping.exe",
+                                ]
+                                for marvel_exe in marvel_exes:
+                                    if marvel_exe.exists():
+                                        exe_found = marvel_exe
+                                        break
+                                
+                                # If still not found, do a deep search for Marvel Rivals specifically
+                                if not exe_found:
+                                    try:
+                                        for root, dirs, files in os.walk(gpath):
+                                            depth = root[len(str(gpath)):].count(os.sep)
+                                            if depth > 5:
+                                                dirs.clear()
+                                                continue
+                                            for file in files:
+                                                if file.lower() in ['marvelrivals-win64-shipping.exe', 'marvelrivals.exe']:
+                                                    exe_found = Path(root) / file
+                                                    break
+                                            if exe_found:
+                                                break
+                                    except Exception:
+                                        pass
+                            
+                            # Special handling for Fortnite
+                            elif "fortnite" in name.lower():
+                                fortnite_exes = [
+                                    gpath / "FortniteGame" / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
+                                    gpath / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
+                                    gpath / "FortniteClient-Win64-Shipping.exe",
+                                ]
+                                for fortnite_exe in fortnite_exes:
+                                    if fortnite_exe.exists():
+                                        exe_found = fortnite_exe
+                                        break
+                                
+                                # If still not found, search for it
+                                if not exe_found:
+                                    try:
+                                        for root, dirs, files in os.walk(gpath):
+                                            depth = root[len(str(gpath)):].count(os.sep)
+                                            if depth > 5:
+                                                dirs.clear()
+                                                continue
+                                            for file in files:
+                                                if file.lower() in ['fortniteclient-win64-shipping.exe', 'fortnite.exe']:
+                                                    exe_found = Path(root) / file
+                                                    break
+                                            if exe_found:
+                                                break
+                                    except Exception:
+                                        pass
+                            
+                            # Standard detection if not found (for other games or as final fallback)
+                            if not exe_found:
+                                skip_patterns = ['unins', 'install', 'setup', 'crash']
+                                # Don't skip 'launcher' for Marvel Rivals and Fortnite
+                                if "marvel rivals" not in name.lower() and "fortnite" not in name.lower():
+                                    skip_patterns.append('launcher')
+                                
+                                for exe in gpath.glob("*.exe"):
+                                    if not any(skip in exe.stem.lower() for skip in skip_patterns):
+                                        exe_found = exe
+                                        break
+                            
                             # --- Icon extraction removed ---
                             games.append(Game(name, location, "Epic Games", str(exe_found) if exe_found else ""))
                 except Exception:
@@ -554,30 +858,6 @@ class GameScanner:
             winreg.CloseKey(key)
         except Exception:
             pass
-        return games
-
-    def scan_ea(self) -> List[Game]:
-        games = []
-        ea_path = Path(os.environ.get('PROGRAMDATA', 'C:\\ProgramData')) / "Origin" / "LocalContent"
-        if ea_path.exists():
-            for folder in ea_path.iterdir():
-                if folder.is_dir():
-                    for mfst in folder.glob("*.mfst"):
-                        try:
-                            with open(mfst, 'r') as f:
-                                if 'dipinstallpath' in f.read().lower():
-                                    name = folder.name
-                                    if not self.is_excluded(name):
-                                        exe_found = None
-                                        for exe in folder.glob("*.exe"):
-                                            if not any(skip in exe.stem.lower() for skip in ['unins', 'install', 'setup']):
-                                                exe_found = exe
-                                                break
-                                        # --- Icon extraction removed ---
-                                        games.append(Game(name, str(folder), "EA/Origin", str(exe_found) if exe_found else ""))
-                                        break
-                        except Exception:
-                            continue
         return games
 
     def scan_riot(self) -> List[Game]:
@@ -677,15 +957,74 @@ class GameScanner:
                                 games.append(Game(game_name, str(content_folder), "Xbox", str(exes[0])))
         return games
 
+    def scan_marvel_rivals_universal(self) -> List[Game]:
+        """Scan all drives for Marvel Rivals standalone install (excluding Steam/Epic)."""
+        games = []
+        found_paths = set()
+        import string
+
+        drives = [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+
+        for drive in drives:
+            try:
+                for root, dirs, files in os.walk(drive):
+                    skip = ['windows', '$recycle.bin', 'system volume information', 'program files', 'program files (x86)']
+                    dirs[:] = [d for d in dirs if d.lower() not in skip]
+
+                    if root.count(os.sep) - drive.count(os.sep) > 6:
+                        dirs.clear()
+                        continue
+
+                    # Look for folder name Marvel Rivals
+                    if os.path.basename(root).lower() == "marvel rivals":
+                        root_lower = root.lower()
+                        if "steamapps" in root_lower or "epic" in root_lower:
+                            continue  # skip Steam / Epic
+
+                        game_path = Path(root)
+                        exe_found = None
+
+                        # Look specifically for the shipping exe
+                        for r, d2, f2 in os.walk(game_path):
+                            for file in f2:
+                                if file.lower() == "marvelrivals-win64-shipping.exe":
+                                    exe_found = Path(r) / file
+                                    break
+                            if exe_found:
+                                break
+
+                        # Fallback
+                        if not exe_found:
+                            for r, d2, f2 in os.walk(game_path):
+                                for file in f2:
+                                    if file.lower().endswith(".exe") and "marvel" in file.lower():
+                                        exe_found = Path(r) / file
+                                        break
+                                if exe_found:
+                                    break
+
+                        platform = "NetEase" if "netease" in root_lower else "Other"
+
+                        # Save real EXE path
+                        games.append(
+                            Game("Marvel Rivals", str(game_path), platform, str(exe_found) if exe_found else "")
+                        )
+
+            except:
+                continue
+
+        return games
+
+
     def scan_all(self) -> List[Game]:
         all_games = []
         all_games.extend(self.scan_steam())
         all_games.extend(self.scan_epic())
         all_games.extend(self.scan_gog())
-        all_games.extend(self.scan_ea())
         all_games.extend(self.scan_riot())
         all_games.extend(self.scan_battlenet())
         all_games.extend(self.scan_xbox())
+        all_games.extend(self.scan_marvel_rivals_universal())
         return all_games
 
 # ---------- Monitor ----------
@@ -706,6 +1045,99 @@ class GameMonitor:
                 norm_path = os.path.normpath(game.exe_path).lower()
                 self.exe_map[norm_path] = game.name
                 
+                # Special handling for Marvel Rivals - detect actual game exe across all launchers
+                if "marvel rivals" in game.name.lower():
+                    try:
+                        game_path = Path(game.path)
+                        
+                        # Common Marvel Rivals executable patterns across platforms
+                        marvel_patterns = [
+                            # Steam version
+                            game_path / "MarvelRivals.exe",
+                            game_path / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                            game_path / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                            
+                            # Epic Games version
+                            game_path / "MarvelRivals-Win64-Shipping.exe",
+                            
+                            # NetEase Launcher version - search recursively
+                            game_path / "Game" / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                        ]
+                        
+                        # Try common patterns first
+                        for pattern_path in marvel_patterns:
+                            if pattern_path.exists() and pattern_path.is_file():
+                                marvel_exe_norm = os.path.normpath(str(pattern_path)).lower()
+                                self.exe_map[marvel_exe_norm] = game.name
+                        
+                        # Do a thorough recursive search for ALL Marvel Rivals executables
+                        for root, dirs, files in os.walk(game_path):
+                            depth = root[len(str(game_path)):].count(os.sep)
+                            if depth > 5:  # Limit search depth
+                                dirs.clear()
+                                continue
+                            for file in files:
+                                file_lower = file.lower()
+                                # Add ONLY the actual game executable, NOT launchers
+                                if file.endswith('.exe'):
+                                    # ONLY detect the actual game exe - NOT launcher
+                                    # Must contain "shipping" to be considered the game
+                                    if 'shipping' in file_lower and 'marvelrivals' in file_lower:
+                                        marvel_exe = Path(root) / file
+                                        marvel_exe_norm = os.path.normpath(str(marvel_exe)).lower()
+                                        self.exe_map[marvel_exe_norm] = game.name
+                                    # Also accept if it's specifically in Win64 folder and has marvelrivals in name
+                                    elif 'win64' in root.lower() and 'marvelrivals' in file_lower and 'launcher' not in file_lower:
+                                        marvel_exe = Path(root) / file
+                                        marvel_exe_norm = os.path.normpath(str(marvel_exe)).lower()
+                                        self.exe_map[marvel_exe_norm] = game.name
+                    except Exception:
+                        pass
+                
+                # Special handling for Fortnite - detect actual game exe
+                elif "fortnite" in game.name.lower():
+                    try:
+                        game_path = Path(game.path)
+                        
+                        # Common Fortnite executable patterns
+                        fortnite_patterns = [
+                            game_path / "FortniteGame" / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
+                            game_path / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
+                            game_path / "FortniteClient-Win64-Shipping.exe",
+                            game_path / "FortniteGame" / "Binaries" / "Win64" / "FortniteLauncher.exe",
+                        ]
+                        
+                        # Try common patterns first
+                        for pattern_path in fortnite_patterns:
+                            if pattern_path.exists() and pattern_path.is_file():
+                                fortnite_exe_norm = os.path.normpath(str(pattern_path)).lower()
+                                self.exe_map[fortnite_exe_norm] = game.name
+                        
+                        # Do a thorough recursive search for Fortnite executables
+                        for root, dirs, files in os.walk(game_path):
+                            depth = root[len(str(game_path)):].count(os.sep)
+                            if depth > 5:  # Limit search depth
+                                dirs.clear()
+                                continue
+                            for file in files:
+                                file_lower = file.lower()
+                                # Add ANY exe that might be the game
+                                if file.endswith('.exe'):
+                                    # Priority 1: Game client
+                                    if any(keyword in file_lower for keyword in ['fortniteclient', 'shipping']):
+                                        fortnite_exe = Path(root) / file
+                                        fortnite_exe_norm = os.path.normpath(str(fortnite_exe)).lower()
+                                        self.exe_map[fortnite_exe_norm] = game.name
+                                    # Priority 2: Any exe in FortniteGame/Binaries folder
+                                    elif 'fortnitegame' in root.lower() and 'binaries' in root.lower():
+                                        fortnite_exe = Path(root) / file
+                                        fortnite_exe_norm = os.path.normpath(str(fortnite_exe)).lower()
+                                        self.exe_map[fortnite_exe_norm] = game.name
+                    except Exception:
+                        pass
+                    except Exception: # type: ignore
+                        pass
+                
                 # Also add the parent directory's other executables for games with multiple EXEs
                 try:
                     exe_dir = Path(game.exe_path).parent
@@ -714,7 +1146,17 @@ class GameMonitor:
                         if exe_norm not in self.exe_map:
                             # Only add if it's a reasonable game executable (not an installer/uninstaller)
                             exe_name = exe.stem.lower()
-                            if not any(skip in exe_name for skip in ['unins', 'install', 'setup', 'launcher', 'crash', 'report']):
+                            skip_patterns = ['unins', 'install', 'setup', 'crash', 'report']
+                            
+                            # For Marvel Rivals, ONLY accept the shipping exe, NOT launcher
+                            if "marvel rivals" in game.name.lower():
+                                if 'shipping' not in exe_name or 'launcher' in exe_name:
+                                    continue  # Skip non-shipping or launcher executables
+                            # Only skip launcher for games that aren't Fortnite
+                            elif "fortnite" not in game.name.lower():
+                                skip_patterns.append('launcher')
+                            
+                            if not any(skip in exe_name for skip in skip_patterns):
                                 self.exe_map[exe_norm] = game.name
                 except Exception:
                     pass
@@ -786,7 +1228,7 @@ class GameMonitor:
                 games_to_close = []
                 for game_name, start_time in list(self.close_timers.items()):
                     elapsed = current_time - start_time
-                    if elapsed >= 30:
+                    if elapsed >= 5:
                         games_to_close.append(game_name)
 
                 for game_name in games_to_close:
@@ -823,11 +1265,11 @@ class GUI:
             pass
 
         # Window geometry
-        w, h = 1200, 800
+        w, h = 1250, 800
         x = (root.winfo_screenwidth() - w) // 2
         y = (root.winfo_screenheight() - h) // 2
         self.root.geometry(f"{w}x{h}+{x}+{y}")
-        self.root.minsize(1000, 700)
+        self.root.minsize(1100, 700)
         self.root.configure(bg="#0a0e27")
 
         # Close behavior
@@ -844,11 +1286,16 @@ class GUI:
         self.monitor = None
         self.games = []
         self.filtered = []
+        
+        # Initialize updater
+        self.updater = AutoUpdater(APP_VERSION, GITHUB_REPO, GITHUB_API_URL)
 
         self.setup_ui()
         self.root.after(1400, self.load_cache)
         # Auto-start monitor if Twitch is authenticated (after cache loads)
         self.root.after(1600, self.auto_start_monitor)
+        # Check for updates after UI loads (non-blocking)
+        self.root.after(2000, self.check_for_updates_background)
 
     def setup_ui(self):
         # UI kept identical to your original implementation (unchanged)
@@ -863,6 +1310,15 @@ class GUI:
         title_text = tk.Frame(title_frame, bg="#0f1629")
         title_text.pack(side="left")
         tk.Label(title_text, text="Twitch Game Changer", font=("Segoe UI", 32, "bold"), bg="#0f1629", fg="#ffffff").pack(anchor="w")
+        
+        # Version and update button container
+        version_container = tk.Frame(title_text, bg="#0f1629")
+        version_container.pack(anchor="w")
+        tk.Label(version_container, text=f"v{APP_VERSION}", font=("Segoe UI", 11), bg="#0f1629", fg="#6b7280").pack(side="left")
+        self.update_indicator = tk.Label(version_container, text="", font=("Segoe UI", 10, "bold"), bg="#0f1629", fg="#10b981", cursor="hand2")
+        self.update_indicator.pack(side="left", padx=(10, 0))
+        self.update_indicator.bind("<Button-1>", lambda e: self.show_update_dialog())
+        
         tk.Label(title_text, text="Automatically change your Twitch category when you play", font=("Segoe UI", 11), bg="#0f1629", fg="#6b7280").pack(anchor="w")
 
         ctrl = tk.Frame(self.root, bg="#0a0e27")
@@ -871,6 +1327,7 @@ class GUI:
         btn_container.pack(side="left")
         btn_style = {"font": ("Segoe UI", 10, "bold"), "relief": "flat", "cursor": "hand2", "borderwidth": 0, "padx": 20, "pady": 10}
         tk.Button(btn_container, text="🔍 Scan", command=self.scan, bg="#3b82f6", fg="#ffffff", activebackground="#2563eb", **btn_style).pack(side="left", padx=5)
+        tk.Button(btn_container, text="➕ Add Game", command=self.add_manual_game, bg="#8b5cf6", fg="#ffffff", activebackground="#7c3aed", **btn_style).pack(side="left", padx=5)
         tk.Button(btn_container, text="📡 Twitch", command=self.twitch_settings, bg="#9146ff", fg="#ffffff", activebackground="#7c3aed", **btn_style).pack(side="left", padx=5)
         tk.Button(btn_container, text="🗑️ Excluded", command=self.show_excluded_games, bg="#1f2937", fg="#ffffff", activebackground="#111827", **btn_style).pack(side="left", padx=5)
         self.monitor_btn = tk.Button(btn_container, text="⚪ Monitor", command=self.toggle_monitor, bg="#10b981", fg="#ffffff", activebackground="#059669", **btn_style)
@@ -893,7 +1350,7 @@ class GUI:
         style.theme_use('clam')
         style.configure('Modern.TCombobox', fieldbackground='#1a1f3a', background='#1a1f3a', foreground='#ffffff', borderwidth=0, arrowcolor='#6b7280')
         style.map('Modern.TCombobox', fieldbackground=[('readonly', '#1a1f3a')], selectbackground=[('readonly', '#1a1f3a')], selectforeground=[('readonly', '#ffffff')])
-        platform_combo = ttk.Combobox(filter_frame, textvariable=self.platform_var, values=["All Platforms", "Steam", "Epic Games", "GOG", "EA/Origin", "Riot Games", "Battle.net", "Xbox"], state="readonly", font=("Segoe UI", 10), width=16, style='Modern.TCombobox')
+        platform_combo = ttk.Combobox(filter_frame, textvariable=self.platform_var, values=["All Platforms", "Steam", "Epic Games", "GOG", "Riot Games", "Battle.net", "Xbox", "Other"], state="readonly", font=("Segoe UI", 10), width=16, style='Modern.TCombobox')
         platform_combo.pack(padx=10, pady=7)
         self.platform_var.trace("w", lambda *args: self.filter())
 
@@ -925,14 +1382,30 @@ class GUI:
         threading.Thread(target=self._do_scan, daemon=True).start()
 
     def _do_scan(self):
-        self.games = self.scanner.scan_all()
+        # Preserve manually added games (those with "Other" platform)
+        manual_games = [g for g in self.games if g.platform == "Other"]
+        
+        # Scan for new games
+        scanned_games = self.scanner.scan_all()
+        
+        # Merge manual games with scanned games (avoid duplicates by name)
+        scanned_names = {g.name.lower() for g in scanned_games}
+        for manual_game in manual_games:
+            if manual_game.name.lower() not in scanned_names:
+                scanned_games.append(manual_game)
+        
+        self.games = scanned_games
         self.save_cache()
         gc.collect()
         self.root.after(0, self._finish_scan)
 
     def _finish_scan(self):
         self.filtered = self.games.copy()
-        self.status.config(text=f"✅ Found {len(self.games)} games across all platforms", fg="#10b981")
+        manual_count = len([g for g in self.games if g.platform == "Other"])
+        if manual_count > 0:
+            self.status.config(text=f"✅ Found {len(self.games)} games ({manual_count} manually added)", fg="#10b981")
+        else:
+            self.status.config(text=f"✅ Found {len(self.games)} games across all platforms", fg="#10b981")
         self.display()
         # Auto-start monitor after scan if Twitch is authenticated
         self.root.after(500, self.auto_start_monitor)
@@ -1100,6 +1573,106 @@ class GUI:
         tk.Button(btn_frame, text="Cancel", command=dialog.destroy, font=("Segoe UI", 11), bg="#374151", fg="#ffffff", relief="flat", padx=30, pady=10, cursor="hand2", borderwidth=0).pack(side="left", padx=5)
         tk.Label(dialog, text="💡 Click 'Authenticate' to login with Twitch (opens browser)", font=("Segoe UI", 9), bg="#0f1629", fg="#6b7280").pack(pady=(0, 10))
 
+    def add_manual_game(self):
+        """Manual game adder dialog"""
+        from tkinter import filedialog
+        
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Add Game Manually")
+        dialog.geometry("600x400")
+        dialog.resizable(False, False)  # Disable resizing
+        dialog.configure(bg="#0f1629")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        tk.Label(dialog, text="➕ Add Game Manually", font=("Segoe UI", 18, "bold"), bg="#0f1629", fg="#8b5cf6").pack(pady=20)
+        tk.Label(dialog, text="Add a game that wasn't detected by the automatic scan", font=("Segoe UI", 10), bg="#0f1629", fg="#9ca3af", justify="center", wraplength=450).pack(pady=10)
+        
+        form = tk.Frame(dialog, bg="#0f1629")
+        form.pack(pady=20, padx=40)
+        
+        # Game name input
+        tk.Label(form, text="Game Name:", bg="#0f1629", fg="#ffffff", font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", pady=15)
+        name_entry = tk.Entry(form, font=("Segoe UI", 11), bg="#1a1f3a", fg="#ffffff", width=30, borderwidth=0, relief="flat")
+        name_entry.grid(row=0, column=1, pady=15, ipady=8, padx=10)
+        
+        # Game folder input
+        tk.Label(form, text="Game Folder:", bg="#0f1629", fg="#ffffff", font=("Segoe UI", 11)).grid(row=1, column=0, sticky="w", pady=15)
+        folder_frame = tk.Frame(form, bg="#0f1629")
+        folder_frame.grid(row=1, column=1, pady=15)
+        
+        folder_var = tk.StringVar()
+        folder_entry = tk.Entry(folder_frame, textvariable=folder_var, font=("Segoe UI", 10), bg="#1a1f3a", fg="#ffffff", borderwidth=0, relief="flat", state="readonly", width=28)
+        folder_entry.pack(side="left", ipady=8, padx=(0, 5))
+        
+        def browse_folder():
+            folder = filedialog.askdirectory(title="Select Game Folder")
+            if folder:
+                folder_var.set(folder)
+        
+        tk.Button(folder_frame, text="Browse", command=browse_folder, font=("Segoe UI", 9, "bold"), bg="#3b82f6", fg="#ffffff", relief="flat", padx=15, pady=6, cursor="hand2", borderwidth=0).pack(side="right")
+        
+        btn_frame = tk.Frame(dialog, bg="#0f1629")
+        btn_frame.pack(pady=20)
+        
+        def add_game():
+            name = name_entry.get().strip()
+            folder = folder_var.get().strip()
+            
+            if not name:
+                messagebox.showwarning("Missing Info", "Please enter a game name!")
+                return
+            
+            if not folder:
+                messagebox.showwarning("Missing Info", "Please select a game folder!")
+                return
+            
+            if not os.path.exists(folder):
+                messagebox.showerror("Invalid Folder", "The selected folder doesn't exist!")
+                return
+            
+            # Look for .exe files in the folder
+            exe_found = None
+            try:
+                folder_path = Path(folder)
+                skip_patterns = ['unins', 'install', 'setup', 'crash', 'report', 'redist', 'dotnet', 'directx', 'vcredist', 'unity', 'unreal']
+                
+                # First check root folder
+                exes = [e for e in folder_path.glob("*.exe") if not any(skip in e.stem.lower() for skip in skip_patterns)]
+                if exes:
+                    exe_found = exes[0]
+                else:
+                    # Search subdirectories (max depth 3)
+                    for root, dirs, files in os.walk(folder_path):
+                        depth = root[len(str(folder_path)):].count(os.sep)
+                        if depth > 3:
+                            dirs.clear()
+                            continue
+                        exe_files = [f for f in files if f.endswith('.exe') and not any(skip in f.lower() for skip in skip_patterns)]
+                        if exe_files:
+                            exe_found = Path(root) / exe_files[0]
+                            break
+            except Exception:
+                pass
+            
+            # Add the game with "Other" category
+            new_game = Game(name, folder, "Other", str(exe_found) if exe_found else "")
+            self.games.append(new_game)
+            self.filtered.append(new_game)
+            self.save_cache()
+            self.display()
+            
+            # Update monitor if active
+            if self.monitor and self.monitor.active:
+                self.monitor.games = self.games
+                self.monitor.build_exe_map()
+            
+            self.status.config(text=f"✅ Added '{name}' to your library", fg="#10b981")
+            dialog.destroy()
+        
+        tk.Button(btn_frame, text="➕ Add Game", command=add_game, font=("Segoe UI", 11, "bold"), bg="#8b5cf6", fg="#ffffff", relief="flat", padx=25, pady=10, cursor="hand2", borderwidth=0).pack(side="left", padx=5)
+        tk.Button(btn_frame, text="Cancel", command=dialog.destroy, font=("Segoe UI", 11), bg="#374151", fg="#ffffff", relief="flat", padx=30, pady=10, cursor="hand2", borderwidth=0).pack(side="left", padx=5)
+
     def show_excluded_games(self):
         excluded_list = self.scanner.get_excluded_list()
         dialog = tk.Toplevel(self.root)
@@ -1257,6 +1830,152 @@ class GUI:
             pass
         
         self.root.after(0, self.root.destroy)
+
+    def check_for_updates_background(self):
+        """Check for updates in background without blocking UI"""
+        def check():
+            try:
+                # Only check if enough time has passed
+                if not self.updater.should_check_for_updates():
+                    return
+                
+                update_info = self.updater.check_for_updates()
+                self.updater.save_last_check()
+                
+                if update_info.get('available'):
+                    # Update available - show indicator
+                    def show_indicator():
+                        self.update_indicator.config(text="🔔 Update Available!", fg="#10b981")
+                        self.pending_update = update_info # type: ignore
+                    self.root.after(0, show_indicator)
+            except Exception:
+                pass
+        
+        # Run in background thread
+        threading.Thread(target=check, daemon=True).start()
+    
+    def show_update_dialog(self):
+        """Show update dialog with release notes and install option"""
+        # Check if there's a pending update
+        if not hasattr(self, 'pending_update'):
+            # Manual check
+            self.status.config(text="🔍 Checking for updates...", fg="#60a5fa")
+            
+            def check_and_show():
+                update_info = self.updater.check_for_updates()
+                
+                def show_result():
+                    if update_info.get('available'):
+                        self.pending_update = update_info # type: ignore
+                        self._display_update_dialog(update_info)
+                    else:
+                        self.status.config(text=f"✅ You're on the latest version (v{APP_VERSION})", fg="#10b981")
+                        messagebox.showinfo("No Updates", f"You're already running the latest version!\n\nCurrent version: v{APP_VERSION}")
+                
+                self.root.after(0, show_result)
+            
+            threading.Thread(target=check_and_show, daemon=True).start()
+        else:
+            self._display_update_dialog(self.pending_update) # type: ignore
+    
+    def _display_update_dialog(self, update_info):
+        """Display the actual update dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Update Available")
+        dialog.geometry("700x700")
+        dialog.resizable(False, False)  # Disable resizing
+        dialog.configure(bg="#0f1629")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Header
+        tk.Label(dialog, text="🎉 Update Available!", font=("Segoe UI", 16, "bold"), bg="#0f1629", fg="#10b981").pack(pady=15)
+        
+        # Version info
+        version_frame = tk.Frame(dialog, bg="#0f1629")
+        version_frame.pack(pady=8)
+        tk.Label(version_frame, text=f"Current: v{APP_VERSION}", font=("Segoe UI", 10), bg="#0f1629", fg="#9ca3af").pack()
+        tk.Label(version_frame, text=f"New: v{update_info['version']}", font=("Segoe UI", 12, "bold"), bg="#0f1629", fg="#10b981").pack()
+        
+        # Release notes
+        tk.Label(dialog, text="📝 What's New:", font=("Segoe UI", 11, "bold"), bg="#0f1629", fg="#ffffff").pack(pady=(15, 8))
+        
+        notes_frame = tk.Frame(dialog, bg="#1a1f3a", highlightthickness=1, highlightbackground="#2a2f4a")
+        notes_frame.pack(fill="both", expand=True, padx=25, pady=(0, 15))
+        
+        notes_text = tk.Text(notes_frame, font=("Segoe UI", 9), bg="#1a1f3a", fg="#e5e7eb", 
+                            wrap="word", relief="flat", padx=12, pady=12, height=8)
+        notes_scrollbar = tk.Scrollbar(notes_frame, command=notes_text.yview)
+        notes_text.config(yscrollcommand=notes_scrollbar.set)
+        notes_scrollbar.pack(side="right", fill="y")
+        notes_text.pack(side="left", fill="both", expand=True)
+        
+        # Insert release notes
+        release_notes = update_info.get('release_notes', 'No release notes available.')
+        notes_text.insert("1.0", release_notes)
+        notes_text.config(state="disabled")
+        
+        # Status label
+        status_label = tk.Label(dialog, text="", font=("Segoe UI", 9), bg="#0f1629", fg="#60a5fa")
+        status_label.pack(pady=8)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg="#0f1629")
+        btn_frame.pack(pady=15)
+        
+        def install_update():
+            if not update_info.get('download_url'):
+                messagebox.showerror("Error", "No download URL available for this update.")
+                return
+            
+            # Disable buttons during download
+            install_btn.config(state="disabled")
+            later_btn.config(state="disabled")
+            
+            def update_callback(message):
+                status_label.config(text=message)
+            
+            def do_install():
+                success = self.updater.download_and_install_update(
+                    update_info['download_url'], 
+                    callback=update_callback
+                )
+                
+                if success:
+                    # Installer will handle closing and restarting
+                    def close_app():
+                        status_label.config(text="✅ Update will install shortly...")
+                        self.root.after(2000, lambda: self.quit_app())
+                    self.root.after(0, close_app)
+                else:
+                    def re_enable():
+                        install_btn.config(state="normal")
+                        later_btn.config(state="normal")
+                        status_label.config(text="❌ Update failed. Please try again.", fg="#ef4444")
+                    self.root.after(0, re_enable)
+            
+            threading.Thread(target=do_install, daemon=True).start()
+        
+        install_btn = tk.Button(btn_frame, text="⬇️ Install Update", command=install_update, 
+                               font=("Segoe UI", 10, "bold"), bg="#10b981", fg="#ffffff", 
+                               activebackground="#059669", relief="flat", padx=25, pady=8, 
+                               cursor="hand2", borderwidth=0)
+        install_btn.pack(side="left", padx=4)
+        
+        later_btn = tk.Button(btn_frame, text="Later", command=dialog.destroy, 
+                             font=("Segoe UI", 10), bg="#374151", fg="#ffffff", 
+                             relief="flat", padx=25, pady=8, cursor="hand2", borderwidth=0)
+        later_btn.pack(side="left", padx=4)
+        
+        # View on GitHub button
+        if update_info.get('html_url'):
+            def open_github():
+                import webbrowser
+                webbrowser.open(update_info['html_url'])
+            
+            tk.Button(btn_frame, text="View on GitHub", command=open_github, 
+                     font=("Segoe UI", 8), bg="#1f2937", fg="#9ca3af", 
+                     relief="flat", padx=18, pady=6, cursor="hand2", borderwidth=0).pack(side="left", padx=4)
 
     def on_closing(self):
         """Fallback for non-tray systems, or if tray fails."""
