@@ -76,17 +76,5 @@ If you have Python 3.10+ installed, you can run the app from the source code.
 
 ## 💡 How to Use
 
-1.  **Launch** the application.
-2.  **Scan for Games:** Click the **`🔍 Scan`** button. The app will search your drives for all supported launchers. This may take a minute on the first run. Your games will appear in the main window.
-3.  **Authenticate with Twitch:**
-    * Click the **`📡 Twitch`** button.
-    * Enter your Twitch channel name (e.g., `your_username`).
-    * Click **`🔐 Authenticate`**.
-    * A popup will appear with a code. Your browser will open to `twitch.tv/activate`.
-    * Enter the code on the Twitch page to authorize the app.
-4.  **Enable and Save:**
-    * Once authenticated, check the **"Enable automatic category changes"** box.
-    * Click **`💾 Save`**.
-5.  **Start Monitoring:** Click the **`⚪ Monitor`** button. It will turn green and read **`🟢 Active`**.
-6.  **Minimize:** Close the window. The app will automatically minimize to your system tray.
-7.  **All Done!** Just launch any game from your library, and your Twitch category will update within seconds.
+* Step 1: Click on Release Page on the installation
+  ![](images/step1.png)
