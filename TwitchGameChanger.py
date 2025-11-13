@@ -15,7 +15,7 @@ import base64
 import hashlib
 
 # App version and update settings
-APP_VERSION = "1.0.3"  # Update this when releasing new versions
+APP_VERSION = "2.0.0"  # Update this when releasing new versions
 GITHUB_REPO = "abdullah-alk/Twitch-Game-Changer"  # Change to your actual GitHub repo
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 UPDATE_CHECK_FILE = None  # Will be set after APP_DATA_DIR is created
@@ -40,9 +40,8 @@ TWITCH_CONFIG_FILE = APP_DATA_DIR / 'twitch_config.json'
 EXCLUDED_GAMES_FILE = APP_DATA_DIR / 'excluded_games.json'
 GAMES_CACHE_FILE = APP_DATA_DIR / 'games_cache.json'
 UPDATE_CHECK_FILE = APP_DATA_DIR / 'last_update_check.json'
-# --- ICON_CACHE_DIR removed ---
 
-# ---------- Token Encryption ----------
+# Token Encryption
 class TokenEncryption:
     """Secure token storage with machine-specific encryption"""
     @staticmethod
@@ -284,28 +283,28 @@ class AutoUpdater:
         except Exception:
             return None # type: ignore
 
-# ---------- IconExtractor Class Removed ----------
-
-# ---------- Data class ----------
+# Data Models
 class Game:
-    # --- 'icon' attribute removed from init ---
     def __init__(self, name: str, path: str, platform: str, exe_path: str = ""):
         self.name = name
         self.path = path
         self.platform = platform
         self.exe_path = exe_path if exe_path else path
-        # --- self.icon removed ---
 
-# ---------- Twitch integration ----------
+# Twitch Integration
 class TwitchBot:
     CLIENT_ID = 'll2bpleltqt52whwzu4cidrthdgipj'  # kept as in file
+    _authenticating = False  # Class-level flag to prevent multiple auth dialogs
 
     def __init__(self):
         self.config = self.load_config()
         # Decrypt tokens on load
-        encrypted_token = self.config.get('access_token')
-        self.access_token = TokenEncryption.decrypt(encrypted_token) if encrypted_token else None
+        encrypted_access_token = self.config.get('access_token')
+        encrypted_refresh_token = self.config.get('refresh_token')
+        self.access_token = TokenEncryption.decrypt(encrypted_access_token) if encrypted_access_token else None
+        self.refresh_token = TokenEncryption.decrypt(encrypted_refresh_token) if encrypted_refresh_token else None
         self.user_id = self.config.get('user_id', None)
+        self.token_timestamp = self.config.get('token_timestamp', 0)
 
     def load_config(self) -> dict:
         try:
@@ -319,11 +318,11 @@ class TwitchBot:
 
     def save_config(self):
         try:
-            # Encrypt token before saving
+            # Encrypt tokens before saving
             config_to_save = self.config.copy()
             if self.access_token:
                 config_to_save['access_token'] = TokenEncryption.encrypt(self.access_token)
-            if hasattr(self, 'refresh_token') and self.refresh_token:
+            if self.refresh_token:
                 config_to_save['refresh_token'] = TokenEncryption.encrypt(self.refresh_token)
             with open(TWITCH_CONFIG_FILE, 'w') as f:
                 json.dump(config_to_save, f, indent=2)
@@ -346,22 +345,29 @@ class TwitchBot:
                 self.config.get('channel_name', '') != '')
 
     def authenticate(self) -> bool:
-        """Device flow with refresh token storage."""
+        """Device flow with refresh token storage. Only one auth dialog at a time."""
+        # Prevent multiple authentication dialogs
+        if TwitchBot._authenticating:
+            return False
+        
         if not self.config.get('channel_name'):
             return False
+        
         try:
+            TwitchBot._authenticating = True
             import requests, webbrowser, time, threading
             r = requests.post('https://id.twitch.tv/oauth2/device',
                               data={'client_id': self.CLIENT_ID,
                                     'scopes': 'channel:manage:broadcast'},
                               timeout=10)
             if r.status_code != 200:
+                TwitchBot._authenticating = False
                 return False
 
             data = r.json()
             user_code, device_code = data['user_code'], data['device_code']
             verify_url = data.get('verification_uri', 'https://www.twitch.tv/activate')
-            expires_in = data.get('expires_in', 1800)  # Increased to 30 minutes (1800 seconds)
+            expires_in = data.get('expires_in', 1800)
             interval = data.get('interval', 5)
 
             webbrowser.open(verify_url)
@@ -402,60 +408,102 @@ class TwitchBot:
             if 'access_token' in token_data:
                 self.access_token = token_data['access_token']
                 self.refresh_token = token_data.get('refresh_token')
+                import time
+                self.token_timestamp = time.time()
                 self.config.update({
                     'access_token': self.access_token,
-                    'refresh_token': self.refresh_token
+                    'refresh_token': self.refresh_token,
+                    'token_timestamp': self.token_timestamp
                 })
                 self.save_config()
+                TwitchBot._authenticating = False
                 return True
+            
+            TwitchBot._authenticating = False
             return False
         except Exception:
+            TwitchBot._authenticating = False
             return False
 
     def refresh_access_token(self) -> bool:
         """Use stored refresh_token to get a new access_token silently."""
+        if not self.refresh_token:
+            return False
         try:
             import requests
-            if not self.config.get('refresh_token'):
-                return False
+            import time
             r = requests.post('https://id.twitch.tv/oauth2/token', data={
                 'grant_type': 'refresh_token',
-                'refresh_token': self.config['refresh_token'],
+                'refresh_token': self.refresh_token,
                 'client_id': self.CLIENT_ID
             }, timeout=10)
+            
             if r.status_code == 200:
                 d = r.json()
                 self.access_token = d['access_token']
-                self.config['access_token'] = d['access_token']
+                self.token_timestamp = time.time()
+                self.config['access_token'] = self.access_token
+                self.config['token_timestamp'] = self.token_timestamp
+                # Twitch ALWAYS returns a new refresh token, so update it
                 if 'refresh_token' in d:
-                    self.config['refresh_token'] = d['refresh_token']
+                    self.refresh_token = d['refresh_token']
+                    self.config['refresh_token'] = self.refresh_token
                 self.save_config()
                 return True
+            elif r.status_code == 400:
+                # Refresh token is invalid or expired - need to re-authenticate
+                self.refresh_token = None
+                self.config['refresh_token'] = None
+                self.save_config()
+                return False
         except Exception:
             pass
         return False
 
     def ensure_token_valid(self) -> bool:
-        """Check token validity, refresh or re-auth if needed."""
-        if not self.access_token:
+        """Check token validity, refresh or re-auth if needed. Always tries refresh before re-auth."""
+        import time
+        
+        # Proactive refresh: if token is older than 3 hours (10800 seconds), refresh it
+        # Twitch access tokens typically last ~4 hours, so this prevents expiration
+        token_age = time.time() - self.token_timestamp if self.token_timestamp else float('inf')
+        if token_age > 10800 and self.refresh_token:  # 3 hours = 10800 seconds
             if self.refresh_access_token():
+                return True
+        
+        # If no access token, try refresh first (in case we have refresh token)
+        if not self.access_token:
+            if self.refresh_token and self.refresh_access_token():
                 return True
             return self.authenticate()
 
+        # Try to validate the current access token
         try:
             import requests
             h = {'Authorization': f'Bearer {self.access_token}',
                  'Client-Id': self.CLIENT_ID}
             r = requests.get('https://api.twitch.tv/helix/users', headers=h, timeout=6)
+            
             if r.status_code == 200:
+                # Token is valid
                 return True
             elif r.status_code == 401:
-                if self.refresh_access_token():
+                # Token is invalid/expired - try refresh
+                if self.refresh_token and self.refresh_access_token():
                     return True
+                # Refresh failed - need to re-authenticate
                 return self.authenticate()
+            else:
+                # Other error - try refresh just in case
+                if self.refresh_token and self.refresh_access_token():
+                    return True
+                return False
         except Exception:
-            pass
-        return False
+            # Network error or other exception
+            # Don't immediately re-auth on network errors
+            # The token might still be valid, just couldn't reach API
+            # Return False but don't trigger re-authentication
+            return False
 
     def get_user_id(self) -> bool:
         if not self.access_token:
@@ -579,14 +627,13 @@ class TwitchBot:
         except Exception:
             return False
 
-# ---------- Scanner ----------
+# Game Scanner
 class GameScanner:
     # Applications that should NEVER be included in scans
     PERMANENT_EXCLUSIONS = {
         'Steamworks Common Redistributables',
         'Wallpaper Engine',
-        'wallpaper engine',  # case variation
-        'Steamworks Common Redistributables',  # exact match
+        'wallpaper engine',
     }
     
     def __init__(self):
@@ -635,8 +682,6 @@ class GameScanner:
         import string
         return [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
 
-    # --- Scanning methods modified to remove icon extraction ---
-
     def scan_steam(self) -> List[Game]:
         games = []
         try:
@@ -669,7 +714,13 @@ class GameScanner:
                                                     
                                                     # Special handling for Marvel Rivals on Steam
                                                     if "marvel rivals" in name.lower():
+                                                        # NOTE: Game uses "Marvel" not "MarvelRivals" in exe names!
                                                         marvel_exes = [
+                                                            gpath / "Marvel-Win64-Shipping.exe",
+                                                            gpath / "Marvel" / "Binaries" / "Win64" / "Marvel-Win64-Shipping.exe",
+                                                            gpath / "Binaries" / "Win64" / "Marvel-Win64-Shipping.exe",
+                                                            gpath / "MarvelGame" / "Marvel" / "Binaries" / "Win64" / "Marvel-Win64-Shipping.exe",
+                                                            # Also check for MarvelRivals variant
                                                             gpath / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
                                                             gpath / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
                                                             gpath / "MarvelRivals-Win64-Shipping.exe",
@@ -688,7 +739,10 @@ class GameScanner:
                                                                         dirs.clear()
                                                                         continue
                                                                     for file in files:
-                                                                        if file.lower() in ['marvelrivals-win64-shipping.exe', 'marvelrivals.exe']:
+                                                                        file_lower = file.lower()
+                                                                        # Look for Marvel-Win64-Shipping.exe OR MarvelRivals-Win64-Shipping.exe
+                                                                        if (file_lower.endswith('-win64-shipping.exe') and 
+                                                                            ('marvel-' in file_lower or 'marvelrivals-' in file_lower)):
                                                                             exe_found = Path(root) / file
                                                                             break
                                                                     if exe_found:
@@ -714,13 +768,16 @@ class GameScanner:
                                                                 break
                                                     if not exe_found:
                                                         try:
-                                                            skip_patterns = ['unins', 'install', 'setup', 'crash', 'report', 'redist', 'dotnet', 'directx', 'vcredist', 'unity', 'unreal']
-                                                            # Don't skip 'launcher' for Marvel Rivals since we need SOMETHING
-                                                            if "marvel rivals" not in name.lower():
-                                                                skip_patterns.append('launcher')
+                                                            skip_patterns = ['unins', 'install', 'setup', 'crash', 'report', 'redist', 'dotnet', 'directx', 'vcredist', 'unity', 'unreal', 'launcher']
                                                             
-                                                            exes_root = [e for e in gpath.glob("*.exe") 
-                                                                        if not any(skip in e.stem.lower() for skip in skip_patterns)]
+                                                            # For Marvel Rivals specifically, ONLY accept shipping exe
+                                                            if "marvel rivals" in name.lower():
+                                                                exes_root = [e for e in gpath.glob("*.exe") 
+                                                                            if 'shipping' in e.stem.lower() and not any(skip in e.stem.lower() for skip in skip_patterns)]
+                                                            else:
+                                                                exes_root = [e for e in gpath.glob("*.exe") 
+                                                                            if not any(skip in e.stem.lower() for skip in skip_patterns)]
+                                                            
                                                             if exes_root:
                                                                 game_exes = [e for e in exes_root if 'game' in e.stem.lower() or installdir.lower() in e.stem.lower()]
                                                                 exe_found = game_exes[0] if game_exes else exes_root[0]
@@ -730,15 +787,23 @@ class GameScanner:
                                                                     if depth > 3:
                                                                         dirs.clear()
                                                                         continue
-                                                                    exe_files = [f for f in files if f.endswith('.exe') 
-                                                                                and not any(skip in f.lower() for skip in skip_patterns)]
+                                                                    
+                                                                    # For Marvel Rivals, ONLY look for shipping exe
+                                                                    if "marvel rivals" in name.lower():
+                                                                        exe_files = [f for f in files if f.endswith('.exe') 
+                                                                                    and 'shipping' in f.lower()
+                                                                                    and ('marvel-' in f.lower() or 'marvelrivals-' in f.lower())
+                                                                                    and not any(skip in f.lower() for skip in skip_patterns)]
+                                                                    else:
+                                                                        exe_files = [f for f in files if f.endswith('.exe') 
+                                                                                    and not any(skip in f.lower() for skip in skip_patterns)]
+                                                                    
                                                                     if exe_files:
                                                                         game_exes = [f for f in exe_files if 'game' in f.lower() or installdir.lower() in f.lower()]
                                                                         exe_found = Path(root) / (game_exes[0] if game_exes else exe_files[0])
                                                                         break
                                                         except Exception:
                                                             pass
-                                                    # --- Icon extraction removed ---
                                                     games.append(Game(name, str(gpath), "Steam", str(exe_found) if exe_found else ""))
                                     except Exception:
                                         continue
@@ -830,7 +895,6 @@ class GameScanner:
                                         exe_found = exe
                                         break
                             
-                            # --- Icon extraction removed ---
                             games.append(Game(name, location, "Epic Games", str(exe_found) if exe_found else ""))
                 except Exception:
                     continue
@@ -850,7 +914,6 @@ class GameScanner:
                     winreg.CloseKey(subkey)
                     if Path(path).exists() and not self.is_excluded(name):
                         exe_path = str(Path(path) / exe)
-                        # --- Icon extraction removed ---
                         games.append(Game(name, path, "GOG", exe_path))
                     i += 1
                 except OSError:
@@ -876,11 +939,41 @@ class GameScanner:
                             if exes and not self.is_excluded(folder.name):
                                 if not any(g.name == folder.name for g in games):
                                     exe_found = None
-                                    for exe in folder.glob("*.exe"):
-                                        if not any(skip in exe.stem.lower() for skip in ['unins', 'install', 'setup']):
-                                            exe_found = exe
-                                            break
-                                    # --- Icon extraction removed ---
+                                    
+                                    # Special handling for VALORANT - find the actual game exe
+                                    if folder.name.lower() == "valorant":
+                                        valorant_patterns = [
+                                            folder / "live" / "ShooterGame" / "Binaries" / "Win64" / "VALORANT-Win64-Shipping.exe",
+                                            folder / "live" / "VALORANT-Win64-Shipping.exe",
+                                            folder / "VALORANT-Win64-Shipping.exe",
+                                            folder / "VALORANT.exe",
+                                        ]
+                                        
+                                        for pattern in valorant_patterns:
+                                            if pattern.exists() and pattern.is_file():
+                                                exe_found = pattern
+                                                break
+                                        
+                                        # Deep search if not found
+                                        if not exe_found:
+                                            for root, dirs, files in os.walk(folder):
+                                                for file in files:
+                                                    file_lower = file.lower()
+                                                    if file_lower == "valorant-win64-shipping.exe" or file_lower == "valorant.exe":
+                                                        # Make sure it's not the launcher
+                                                        if "riotclient" not in file_lower:
+                                                            exe_found = Path(root) / file
+                                                            break
+                                                if exe_found:
+                                                    break
+                                    
+                                    # Standard detection for other Riot games
+                                    if not exe_found:
+                                        for exe in folder.glob("*.exe"):
+                                            if not any(skip in exe.stem.lower() for skip in ['unins', 'install', 'setup', 'riotclient']):
+                                                exe_found = exe
+                                                break
+                                    
                                     games.append(Game(folder.name, str(folder), "Riot Games", str(exe_found) if exe_found else ""))
         return games
 
@@ -923,7 +1016,6 @@ class GameScanner:
                                         pass
                                 if exe_found and not self.is_excluded(game_info["name"]):
                                     if not any(g.name == game_info["name"] for g in games):
-                                        # --- Icon extraction removed ---
                                         games.append(Game(game_info["name"], str(item), "Battle.net", str(exe_found)))
                                         break
             except Exception:
@@ -953,7 +1045,6 @@ class GameScanner:
                         exes = list(content_folder.glob("*.exe"))
                         if exes and not self.is_excluded(game_name):
                             if not any(g.name == game_name for g in games):
-                                # --- Icon extraction removed ---
                                 games.append(Game(game_name, str(content_folder), "Xbox", str(exes[0])))
         return games
 
@@ -985,19 +1076,27 @@ class GameScanner:
                         exe_found = None
 
                         # Look specifically for the shipping exe
+                        # NOTE: Game uses "Marvel" not "MarvelRivals" in exe names!
                         for r, d2, f2 in os.walk(game_path):
                             for file in f2:
-                                if file.lower() == "marvelrivals-win64-shipping.exe":
+                                file_lower = file.lower()
+                                # Look for Marvel-Win64-Shipping.exe OR MarvelRivals-Win64-Shipping.exe
+                                if (file_lower.endswith('-win64-shipping.exe') and 
+                                    ('marvel-' in file_lower or 'marvelrivals-' in file_lower)):
                                     exe_found = Path(r) / file
                                     break
                             if exe_found:
                                 break
 
-                        # Fallback
+                        # Fallback - ONLY accept shipping exe, NOT launcher
                         if not exe_found:
                             for r, d2, f2 in os.walk(game_path):
                                 for file in f2:
-                                    if file.lower().endswith(".exe") and "marvel" in file.lower():
+                                    file_lower = file.lower()
+                                    # MUST have "shipping" in the name to be accepted
+                                    if (file_lower.endswith(".exe") and 
+                                        "shipping" in file_lower and 
+                                        ("marvel" in file_lower or "marvelrivals" in file_lower)):
                                         exe_found = Path(r) / file
                                         break
                                 if exe_found:
@@ -1027,7 +1126,7 @@ class GameScanner:
         all_games.extend(self.scan_marvel_rivals_universal())
         return all_games
 
-# ---------- Monitor ----------
+# Game Monitor
 class GameMonitor:
     def __init__(self, games: List[Game], twitch: TwitchBot, status_callback):
         self.games = games
@@ -1041,104 +1140,154 @@ class GameMonitor:
     def build_exe_map(self):
         self.exe_map.clear()
         for game in self.games:
+            # Special handling for Marvel Rivals - ALWAYS try to find the shipping exe
+            if "marvel rivals" in game.name.lower():
+                try:
+                    game_path = Path(game.path)
+                    
+                    # Common Marvel Rivals executable patterns across platforms
+                    # NOTE: The game uses "Marvel" not "MarvelRivals" in exe names!
+                    marvel_patterns = [
+                        # Steam version - uses "Marvel" not "MarvelRivals"
+                        game_path / "Marvel.exe",
+                        game_path / "Marvel-Win64-Shipping.exe",
+                        game_path / "Marvel" / "Binaries" / "Win64" / "Marvel-Win64-Shipping.exe",
+                        game_path / "Binaries" / "Win64" / "Marvel-Win64-Shipping.exe",
+                        
+                        # Also check for MarvelRivals variant (some versions)
+                        game_path / "MarvelRivals.exe",
+                        game_path / "MarvelRivals-Win64-Shipping.exe",
+                        game_path / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                        
+                        # Epic Games version
+                        game_path / "MarvelRivals-Win64-Shipping.exe",
+                        
+                        # NetEase/Standalone Launcher version
+                        game_path / "Game" / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
+                        game_path / "MarvelGame" / "Marvel" / "Binaries" / "Win64" / "Marvel-Win64-Shipping.exe",
+                    ]
+                    
+                    # Try common patterns first
+                    for pattern_path in marvel_patterns:
+                        if pattern_path.exists() and pattern_path.is_file():
+                            marvel_exe_norm = os.path.normpath(str(pattern_path)).lower()
+                            self.exe_map[marvel_exe_norm] = game.name
+                    
+                    # Do a thorough recursive search for ONLY the shipping executable
+                    # Accept EITHER "Marvel" OR "MarvelRivals" in the filename
+                    for root, dirs, files in os.walk(game_path):
+                        depth = root[len(str(game_path)):].count(os.sep)
+                        if depth > 6:  # Increased depth for nested structures
+                            dirs.clear()
+                            continue
+                        for file in files:
+                            file_lower = file.lower()
+                            # Add ONLY the actual game executable with "shipping" in name
+                            # Accept: Marvel-Win64-Shipping.exe OR MarvelRivals-Win64-Shipping.exe
+                            # Reject: Anything with "launcher"
+                            if (file_lower.endswith('.exe') and 
+                                'shipping' in file_lower and 
+                                ('marvel-' in file_lower or 'marvelrivals-' in file_lower) and
+                                'launcher' not in file_lower):
+                                marvel_exe = Path(root) / file
+                                marvel_exe_norm = os.path.normpath(str(marvel_exe)).lower()
+                                self.exe_map[marvel_exe_norm] = game.name
+                    
+                except Exception:
+                    pass
+                # Don't process the rest of the standard logic for Marvel Rivals
+                continue
+            
+            # Special handling for Valorant - ALWAYS try to find the shipping exe
+            if "valorant" in game.name.lower():
+                try:
+                    game_path = Path(game.path)
+                    
+                    # Common Valorant executable patterns
+                    valorant_patterns = [
+                        game_path / "live" / "ShooterGame" / "Binaries" / "Win64" / "VALORANT-Win64-Shipping.exe",
+                        game_path / "live" / "VALORANT-Win64-Shipping.exe",
+                        game_path / "VALORANT-Win64-Shipping.exe",
+                        game_path / "VALORANT.exe",
+                    ]
+                    
+                    # Try common patterns first
+                    for pattern_path in valorant_patterns:
+                        if pattern_path.exists() and pattern_path.is_file():
+                            valorant_exe_norm = os.path.normpath(str(pattern_path)).lower()
+                            self.exe_map[valorant_exe_norm] = game.name
+                    
+                    # Do a thorough recursive search for the shipping executable
+                    for root, dirs, files in os.walk(game_path):
+                        depth = root[len(str(game_path)):].count(os.sep)
+                        if depth > 6:
+                            dirs.clear()
+                            continue
+                        for file in files:
+                            file_lower = file.lower()
+                            # Look for VALORANT-Win64-Shipping.exe (NOT RiotClientServices.exe)
+                            if (file_lower.endswith('.exe') and 
+                                'valorant' in file_lower and 
+                                ('shipping' in file_lower or file_lower == 'valorant.exe') and
+                                'riotclient' not in file_lower):
+                                valorant_exe = Path(root) / file
+                                valorant_exe_norm = os.path.normpath(str(valorant_exe)).lower()
+                                self.exe_map[valorant_exe_norm] = game.name
+                    
+                except Exception:
+                    pass
+                # Don't process the rest of the standard logic for Valorant
+                continue
+            
+            # Standard processing for other games
             if game.exe_path and os.path.exists(game.exe_path):
                 norm_path = os.path.normpath(game.exe_path).lower()
                 self.exe_map[norm_path] = game.name
                 
-                # Special handling for Marvel Rivals - detect actual game exe across all launchers
-                if "marvel rivals" in game.name.lower():
-                    try:
-                        game_path = Path(game.path)
-                        
-                        # Common Marvel Rivals executable patterns across platforms
-                        marvel_patterns = [
-                            # Steam version
-                            game_path / "MarvelRivals.exe",
-                            game_path / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
-                            game_path / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
-                            
-                            # Epic Games version
-                            game_path / "MarvelRivals-Win64-Shipping.exe",
-                            
-                            # NetEase Launcher version - search recursively
-                            game_path / "Game" / "MarvelRivals" / "Binaries" / "Win64" / "MarvelRivals-Win64-Shipping.exe",
-                        ]
-                        
-                        # Try common patterns first
-                        for pattern_path in marvel_patterns:
-                            if pattern_path.exists() and pattern_path.is_file():
-                                marvel_exe_norm = os.path.normpath(str(pattern_path)).lower()
-                                self.exe_map[marvel_exe_norm] = game.name
-                        
-                        # Do a thorough recursive search for ALL Marvel Rivals executables
-                        for root, dirs, files in os.walk(game_path):
-                            depth = root[len(str(game_path)):].count(os.sep)
-                            if depth > 5:  # Limit search depth
-                                dirs.clear()
-                                continue
-                            for file in files:
-                                file_lower = file.lower()
-                                # Add ONLY the actual game executable, NOT launchers
-                                if file.endswith('.exe'):
-                                    # ONLY detect the actual game exe - NOT launcher
-                                    # Must contain "shipping" to be considered the game
-                                    if 'shipping' in file_lower and 'marvelrivals' in file_lower:
-                                        marvel_exe = Path(root) / file
-                                        marvel_exe_norm = os.path.normpath(str(marvel_exe)).lower()
-                                        self.exe_map[marvel_exe_norm] = game.name
-                                    # Also accept if it's specifically in Win64 folder and has marvelrivals in name
-                                    elif 'win64' in root.lower() and 'marvelrivals' in file_lower and 'launcher' not in file_lower:
-                                        marvel_exe = Path(root) / file
-                                        marvel_exe_norm = os.path.normpath(str(marvel_exe)).lower()
-                                        self.exe_map[marvel_exe_norm] = game.name
-                    except Exception:
-                        pass
-                
-                # Special handling for Fortnite - detect actual game exe
-                elif "fortnite" in game.name.lower():
-                    try:
-                        game_path = Path(game.path)
-                        
-                        # Common Fortnite executable patterns
-                        fortnite_patterns = [
-                            game_path / "FortniteGame" / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
-                            game_path / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
-                            game_path / "FortniteClient-Win64-Shipping.exe",
-                            game_path / "FortniteGame" / "Binaries" / "Win64" / "FortniteLauncher.exe",
-                        ]
-                        
-                        # Try common patterns first
-                        for pattern_path in fortnite_patterns:
-                            if pattern_path.exists() and pattern_path.is_file():
-                                fortnite_exe_norm = os.path.normpath(str(pattern_path)).lower()
-                                self.exe_map[fortnite_exe_norm] = game.name
-                        
-                        # Do a thorough recursive search for Fortnite executables
-                        for root, dirs, files in os.walk(game_path):
-                            depth = root[len(str(game_path)):].count(os.sep)
-                            if depth > 5:  # Limit search depth
-                                dirs.clear()
-                                continue
-                            for file in files:
-                                file_lower = file.lower()
-                                # Add ANY exe that might be the game
-                                if file.endswith('.exe'):
-                                    # Priority 1: Game client
-                                    if any(keyword in file_lower for keyword in ['fortniteclient', 'shipping']):
-                                        fortnite_exe = Path(root) / file
-                                        fortnite_exe_norm = os.path.normpath(str(fortnite_exe)).lower()
-                                        self.exe_map[fortnite_exe_norm] = game.name
-                                    # Priority 2: Any exe in FortniteGame/Binaries folder
-                                    elif 'fortnitegame' in root.lower() and 'binaries' in root.lower():
-                                        fortnite_exe = Path(root) / file
-                                        fortnite_exe_norm = os.path.normpath(str(fortnite_exe)).lower()
-                                        self.exe_map[fortnite_exe_norm] = game.name
-                    except Exception:
-                        pass
-                    except Exception: # type: ignore
-                        pass
-                
-                # Also add the parent directory's other executables for games with multiple EXEs
+            # Special handling for Fortnite - detect actual game exe
+            if "fortnite" in game.name.lower():
+                try:
+                    game_path = Path(game.path)
+                    
+                    # Common Fortnite executable patterns
+                    fortnite_patterns = [
+                        game_path / "FortniteGame" / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
+                        game_path / "Binaries" / "Win64" / "FortniteClient-Win64-Shipping.exe",
+                        game_path / "FortniteClient-Win64-Shipping.exe",
+                        game_path / "FortniteGame" / "Binaries" / "Win64" / "FortniteLauncher.exe",
+                    ]
+                    
+                    # Try common patterns first
+                    for pattern_path in fortnite_patterns:
+                        if pattern_path.exists() and pattern_path.is_file():
+                            fortnite_exe_norm = os.path.normpath(str(pattern_path)).lower()
+                            self.exe_map[fortnite_exe_norm] = game.name
+                    
+                    # Do a thorough recursive search for Fortnite executables
+                    for root, dirs, files in os.walk(game_path):
+                        depth = root[len(str(game_path)):].count(os.sep)
+                        if depth > 5:  # Limit search depth
+                            dirs.clear()
+                            continue
+                        for file in files:
+                            file_lower = file.lower()
+                            # Add ANY exe that might be the game
+                            if file.endswith('.exe'):
+                                # Priority 1: Game client
+                                if any(keyword in file_lower for keyword in ['fortniteclient', 'shipping']):
+                                    fortnite_exe = Path(root) / file
+                                    fortnite_exe_norm = os.path.normpath(str(fortnite_exe)).lower()
+                                    self.exe_map[fortnite_exe_norm] = game.name
+                                # Priority 2: Any exe in FortniteGame/Binaries folder
+                                elif 'fortnitegame' in root.lower() and 'binaries' in root.lower():
+                                    fortnite_exe = Path(root) / file
+                                    fortnite_exe_norm = os.path.normpath(str(fortnite_exe)).lower()
+                                    self.exe_map[fortnite_exe_norm] = game.name
+                except Exception:
+                    pass
+            
+            # Also add the parent directory's other executables for games with multiple EXEs
+            if game.exe_path and os.path.exists(game.exe_path):
                 try:
                     exe_dir = Path(game.exe_path).parent
                     for exe in exe_dir.glob("*.exe"):
@@ -1150,8 +1299,11 @@ class GameMonitor:
                             
                             # For Marvel Rivals, ONLY accept the shipping exe, NOT launcher
                             if "marvel rivals" in game.name.lower():
-                                if 'shipping' not in exe_name or 'launcher' in exe_name:
-                                    continue  # Skip non-shipping or launcher executables
+                                # Must contain BOTH "shipping" AND not contain "launcher"
+                                if 'shipping' not in exe_name:
+                                    continue  # Skip non-shipping executables
+                                if 'launcher' in exe_name:
+                                    continue  # Skip launcher executables
                             # Only skip launcher for games that aren't Fortnite
                             elif "fortnite" not in game.name.lower():
                                 skip_patterns.append('launcher')
@@ -1212,7 +1364,7 @@ class GameMonitor:
                                 if list(self.tracked_pids.values()).count(game_name) == 1:
                                     if self.twitch.config.get('enabled'):
                                         threading.Thread(target=lambda gn=game_name: self.twitch.change_category(gn), daemon=True).start()
-                                    self.status_callback(f"🎮 {game_name} detected!", "#34d399")
+                                    self.status_callback(f"Game {game_name} detected!", "#34d399")
                     except Exception:
                         pass
 
@@ -1235,13 +1387,13 @@ class GameMonitor:
                     del self.close_timers[game_name]
                     if self.twitch.config.get('enabled'):
                         threading.Thread(target=lambda: self.twitch.change_category("Just Chatting"), daemon=True).start()
-                    self.status_callback(f"🔴 {game_name} closed", "#fbbf24")
+                    self.status_callback(f"Closed: {game_name} closed", "#fbbf24")
 
                 time.sleep(3.5)
             except Exception:
                 time.sleep(3.5)
 
-# ---------- GUI ----------
+# GUI Application
 class GUI:
     def __init__(self, root):
         self.root = root
@@ -1298,86 +1450,421 @@ class GUI:
         self.root.after(2000, self.check_for_updates_background)
 
     def setup_ui(self):
-        # UI kept identical to your original implementation (unchanged)
-        header = tk.Frame(self.root, bg="#0f1629", height=120)
-        header.pack(fill="x", padx=0, pady=0)
-        header.pack_propagate(False)
-        header_content = tk.Frame(header, bg="#0f1629")
-        header_content.pack(expand=True)
-        title_frame = tk.Frame(header_content, bg="#0f1629")
-        title_frame.pack()
-        tk.Label(title_frame, text="🎮", font=("Segoe UI", 48), bg="#0f1629", fg="#60a5fa").pack(side="left", padx=(0, 15))
-        title_text = tk.Frame(title_frame, bg="#0f1629")
-        title_text.pack(side="left")
-        tk.Label(title_text, text="Twitch Game Changer", font=("Segoe UI", 32, "bold"), bg="#0f1629", fg="#ffffff").pack(anchor="w")
+        # Smooth, soft color scheme with gradual transitions
+        self.colors = {
+            'bg_dark': '#0d1117',          # Soft dark background
+            'bg_medium': '#161b22',         # Medium background
+            'bg_card': '#1f2937',           # Card background - softer
+            'bg_hover': '#374151',          # Hover state - gentle transition
+            'accent_blue': '#60a5fa',       # Soft blue
+            'accent_purple': '#a78bfa',     # Gentle purple
+            'accent_green': '#34d399',      # Smooth green
+            'accent_red': '#f87171',        # Soft red
+            'accent_orange': '#fb923c',     # Warm orange
+            'text_primary': '#f9fafb',      # Soft white
+            'text_secondary': '#9ca3af',    # Gentle gray
+            'border': '#374151',            # Subtle smooth border
+            'shadow': '#00000050',          # Soft shadow
+        }
         
-        # Version and update button container
-        version_container = tk.Frame(title_text, bg="#0f1629")
-        version_container.pack(anchor="w")
-        tk.Label(version_container, text=f"v{APP_VERSION}", font=("Segoe UI", 11), bg="#0f1629", fg="#6b7280").pack(side="left")
-        self.update_indicator = tk.Label(version_container, text="", font=("Segoe UI", 10, "bold"), bg="#0f1629", fg="#10b981", cursor="hand2")
-        self.update_indicator.pack(side="left", padx=(10, 0))
-        self.update_indicator.bind("<Button-1>", lambda e: self.show_update_dialog())
+        self.root.configure(bg=self.colors['bg_dark'])
         
-        tk.Label(title_text, text="Automatically change your Twitch category when you play", font=("Segoe UI", 11), bg="#0f1629", fg="#6b7280").pack(anchor="w")
-
-        ctrl = tk.Frame(self.root, bg="#0a0e27")
-        ctrl.pack(fill="x", padx=30, pady=20)
-        btn_container = tk.Frame(ctrl, bg="#0a0e27")
-        btn_container.pack(side="left")
-        btn_style = {"font": ("Segoe UI", 10, "bold"), "relief": "flat", "cursor": "hand2", "borderwidth": 0, "padx": 20, "pady": 10}
-        tk.Button(btn_container, text="🔍 Scan", command=self.scan, bg="#3b82f6", fg="#ffffff", activebackground="#2563eb", **btn_style).pack(side="left", padx=5)
-        tk.Button(btn_container, text="➕ Add Game", command=self.add_manual_game, bg="#8b5cf6", fg="#ffffff", activebackground="#7c3aed", **btn_style).pack(side="left", padx=5)
-        tk.Button(btn_container, text="📡 Twitch", command=self.twitch_settings, bg="#9146ff", fg="#ffffff", activebackground="#7c3aed", **btn_style).pack(side="left", padx=5)
-        tk.Button(btn_container, text="🗑️ Excluded", command=self.show_excluded_games, bg="#1f2937", fg="#ffffff", activebackground="#111827", **btn_style).pack(side="left", padx=5)
-        self.monitor_btn = tk.Button(btn_container, text="⚪ Monitor", command=self.toggle_monitor, bg="#10b981", fg="#ffffff", activebackground="#059669", **btn_style)
-        self.monitor_btn.pack(side="left", padx=5)
-
-        search_container = tk.Frame(ctrl, bg="#0a0e27")
-        search_container.pack(side="right")
-        search_box = tk.Frame(search_container, bg="#1a1f3a", highlightthickness=1, highlightbackground="#2a2f4a", highlightcolor="#3b82f6")
-        search_box.pack(side="left", padx=(0, 10))
-        tk.Label(search_box, text="🔎", font=("Segoe UI", 12), bg="#1a1f3a", fg="#6b7280").pack(side="left", padx=(10, 5))
-        self.search_var = tk.StringVar()
-        self.search_var.trace("w", lambda *args: self.filter())
-        search_entry = tk.Entry(search_box, textvariable=self.search_var, font=("Segoe UI", 11), bg="#1a1f3a", fg="#ffffff", relief="flat", width=30, borderwidth=0, insertbackground="#60a5fa")
-        search_entry.pack(side="left", padx=(0, 10), pady=8)
-
-        filter_frame = tk.Frame(search_container, bg="#1a1f3a", highlightthickness=1, highlightbackground="#2a2f4a")
-        filter_frame.pack(side="left")
+        # View mode (grid or list)
+        self.view_mode = tk.StringVar(value="list")  # Default to list view
+        
+        # Image cache for covers/icons
+        self.image_cache = {}
+        
+        # Top control bar with smooth, rounded feel
+        topbar = tk.Frame(self.root, bg=self.colors['bg_medium'], height=80)
+        topbar.pack(fill="x")
+        topbar.pack_propagate(False)
+        
+        # Left side - action buttons (no icons, smooth rounded feel)
+        left_controls = tk.Frame(topbar, bg=self.colors['bg_medium'])
+        left_controls.pack(side="left", padx=25, pady=18)
+        
+        btn_style = {
+            "font": ("Segoe UI", 11, "bold"),
+            "relief": "flat",
+            "cursor": "hand2",
+            "borderwidth": 0,
+            "padx": 24,
+            "pady": 12
+        }
+        
+        # Create buttons with smooth styling (no icons)
+        scan_btn = tk.Button(left_controls, text="Scan", command=self.scan,
+                 bg=self.colors['accent_blue'], fg=self.colors['text_primary'],
+                 activebackground="#4a8de0", **btn_style)
+        scan_btn.pack(side="left", padx=5)
+        
+        add_btn = tk.Button(left_controls, text="Add Game", command=self.add_manual_game,
+                 bg=self.colors['accent_purple'], fg=self.colors['text_primary'],
+                 activebackground="#9d4edd", **btn_style)
+        add_btn.pack(side="left", padx=5)
+        
+        twitch_btn = tk.Button(left_controls, text="Twitch", command=self.twitch_settings,
+                 bg="#9146ff", fg=self.colors['text_primary'],
+                 activebackground="#7c3aed", **btn_style)
+        twitch_btn.pack(side="left", padx=5)
+        
+        excluded_btn = tk.Button(left_controls, text="Excluded", command=self.show_excluded_games,
+                 bg=self.colors['bg_card'], fg=self.colors['text_primary'],
+                 activebackground=self.colors['bg_hover'], **btn_style)
+        excluded_btn.pack(side="left", padx=5)
+        
+        # Monitor button removed - monitoring is automatic when authenticated
+        
+        # Add smooth hover effects to all buttons
+        def create_hover_effect(button, hover_color):
+            original_color = button.cget("bg")
+            def on_enter(e):
+                button.config(bg=hover_color)
+            def on_leave(e):
+                button.config(bg=original_color)
+            button.bind("<Enter>", on_enter)
+            button.bind("<Leave>", on_leave)
+        
+        create_hover_effect(scan_btn, "#4a8de0")
+        create_hover_effect(add_btn, "#9d4edd")
+        create_hover_effect(twitch_btn, "#7c3aed")
+        create_hover_effect(excluded_btn, self.colors['bg_hover'])
+        
+        # Right side - search, filter, view toggle
+        right_controls = tk.Frame(topbar, bg=self.colors['bg_medium'])
+        right_controls.pack(side="right", padx=20, pady=15)
+        
+        # View toggle buttons with smooth rounded styling (no icons)
+        view_frame = tk.Frame(right_controls, bg=self.colors['bg_card'], 
+                             highlightthickness=0)
+        view_frame.pack(side="right", padx=(12, 0))
+        
+        self.list_btn = tk.Button(view_frame, text="List", command=lambda: self.set_view_mode("list"),
+                                  bg=self.colors['accent_blue'], fg=self.colors['text_primary'],
+                                  activebackground="#4a8de0", relief="flat", padx=20, pady=10,
+                                  font=("Segoe UI", 10, "bold"), cursor="hand2", borderwidth=0)
+        self.list_btn.pack(side="left", padx=1)
+        
+        self.grid_btn = tk.Button(view_frame, text="Grid", command=lambda: self.set_view_mode("grid"),
+                                  bg=self.colors['bg_card'], fg=self.colors['text_secondary'],
+                                  activebackground=self.colors['bg_hover'], relief="flat", padx=20, pady=10,
+                                  font=("Segoe UI", 10, "bold"), cursor="hand2", borderwidth=0)
+        self.grid_btn.pack(side="left", padx=1)
+        
+        # Add smooth hover effects
+        def create_view_hover(button):
+            def on_enter(e):
+                if button.cget("bg") != self.colors['accent_blue']:
+                    button.config(bg=self.colors['bg_hover'])
+            def on_leave(e):
+                if button.cget("bg") != self.colors['accent_blue']:
+                    button.config(bg=self.colors['bg_card'])
+            button.bind("<Enter>", on_enter)
+            button.bind("<Leave>", on_leave)
+        
+        create_view_hover(self.list_btn)
+        create_view_hover(self.grid_btn)
+        
+        # Platform filter
+        filter_frame = tk.Frame(right_controls, bg=self.colors['bg_card'], highlightthickness=1,
+                               highlightbackground=self.colors['border'])
+        filter_frame.pack(side="right", padx=4)
         self.platform_var = tk.StringVar(value="All Platforms")
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure('Modern.TCombobox', fieldbackground='#1a1f3a', background='#1a1f3a', foreground='#ffffff', borderwidth=0, arrowcolor='#6b7280')
-        style.map('Modern.TCombobox', fieldbackground=[('readonly', '#1a1f3a')], selectbackground=[('readonly', '#1a1f3a')], selectforeground=[('readonly', '#ffffff')])
-        platform_combo = ttk.Combobox(filter_frame, textvariable=self.platform_var, values=["All Platforms", "Steam", "Epic Games", "GOG", "Riot Games", "Battle.net", "Xbox", "Other"], state="readonly", font=("Segoe UI", 10), width=16, style='Modern.TCombobox')
-        platform_combo.pack(padx=10, pady=7)
+        style.configure('Dark.TCombobox',
+                       fieldbackground=self.colors['bg_card'],
+                       background=self.colors['bg_card'],
+                       foreground=self.colors['text_primary'],
+                       borderwidth=0,
+                       arrowcolor=self.colors['text_secondary'])
+        style.map('Dark.TCombobox',
+                 fieldbackground=[('readonly', self.colors['bg_card'])],
+                 selectbackground=[('readonly', self.colors['bg_card'])],
+                 selectforeground=[('readonly', self.colors['text_primary'])])
+        
+        platform_combo = ttk.Combobox(filter_frame, textvariable=self.platform_var,
+                                     values=["All Platforms", "Steam", "Epic Games", "GOG",
+                                           "Riot Games", "Battle.net", "Xbox", "Other"],
+                                     state="readonly", font=("Segoe UI", 9), width=14,
+                                     style='Dark.TCombobox')
+        platform_combo.pack(padx=8, pady=6)
         self.platform_var.trace("w", lambda *args: self.filter())
-
-        self.status = tk.Label(self.root, text="Ready to scan", font=("Segoe UI", 10), bg="#0a0e27", fg="#6b7280", anchor="w", padx=30, pady=8)
+        
+        # Search box
+        search_box = tk.Frame(right_controls, bg=self.colors['bg_card'], highlightthickness=1,
+                             highlightbackground=self.colors['border'])
+        search_box.pack(side="right", padx=4)
+        self.search_var = tk.StringVar()
+        self.search_var.trace("w", lambda *args: self.filter())
+        search_entry = tk.Entry(search_box, textvariable=self.search_var, font=("Segoe UI", 10),
+                               bg=self.colors['bg_card'], fg=self.colors['text_primary'],
+                               relief="flat", width=25, borderwidth=0,
+                               insertbackground=self.colors['accent_blue'])
+        search_entry.pack(side="left", padx=10, pady=7)
+        search_entry.insert(0, "Search games...")
+        search_entry.bind("<FocusIn>", lambda e: search_entry.delete(0, tk.END) if search_entry.get() == "Search games..." else None)
+        search_entry.bind("<FocusOut>", lambda e: search_entry.insert(0, "Search games...") if not search_entry.get() else None)
+        
+        # Status bar
+        self.status = tk.Label(self.root, text="Ready to scan", font=("Segoe UI", 9),
+                              bg=self.colors['bg_medium'], fg=self.colors['text_secondary'],
+                              anchor="w", padx=20, pady=8)
         self.status.pack(fill="x")
-
-        container = tk.Frame(self.root, bg="#0a0e27")
-        container.pack(fill="both", expand=True, padx=30, pady=(0, 20))
-        scrollbar_frame = tk.Frame(container, bg="#0a0e27", width=12)
-        scrollbar_frame.pack(side="right", fill="y", padx=(10, 0))
-        scrollbar = tk.Canvas(scrollbar_frame, bg="#1a1f3a", width=8, highlightthickness=0)
-        scrollbar.pack(fill="y", expand=True)
-        self.canvas = tk.Canvas(container, bg="#0a0e27", highlightthickness=0)
+        
+        # Version info (bottom left of status bar)
+        version_label = tk.Label(self.status, text=f"v{APP_VERSION}",
+                                font=("Segoe UI", 8), bg=self.colors['bg_medium'],
+                                fg=self.colors['text_secondary'])
+        version_label.place(relx=1.0, rely=0.5, anchor="e", x=-20)
+        
+        self.update_indicator = tk.Label(self.status, text="", font=("Segoe UI", 8, "bold"),
+                                         bg=self.colors['bg_medium'], fg=self.colors['accent_green'],
+                                         cursor="hand2")
+        self.update_indicator.place(relx=1.0, rely=0.5, anchor="e", x=-80)
+        self.update_indicator.bind("<Button-1>", lambda e: self.show_update_dialog())
+        
+        # Main content area with scrolling
+        container = tk.Frame(self.root, bg=self.colors['bg_dark'])
+        container.pack(fill="both", expand=True, padx=15, pady=(10, 15))
+        
+        self.canvas = tk.Canvas(container, bg=self.colors['bg_dark'], highlightthickness=0)
         self.canvas.pack(side="left", fill="both", expand=True)
+        
+        scrollbar = tk.Scrollbar(container, orient="vertical", command=self.canvas.yview,
+                                bg=self.colors['bg_dark'], troughcolor=self.colors['bg_medium'],
+                                activebackground=self.colors['text_secondary'], width=12)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        
+        self.games_frame = tk.Frame(self.canvas, bg=self.colors['bg_dark'])
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.games_frame, anchor="nw")
+        
         def on_configure(event):
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        self.games_frame = tk.Frame(self.canvas, bg="#0a0e27")
-        self.canvas_window = self.canvas.create_window((0, 0), window=self.games_frame, anchor="nw")
         self.games_frame.bind("<Configure>", on_configure)
         self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
+        
         def _on_mousewheel(event):
             self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
         self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+    
+    def set_view_mode(self, mode):
+        """Toggle between grid and list view"""
+        self.view_mode.set(mode)
+        if mode == "list":
+            self.list_btn.config(bg=self.colors['accent_blue'], fg=self.colors['text_primary'])
+            self.grid_btn.config(bg=self.colors['bg_card'], fg=self.colors['text_secondary'])
+        else:
+            self.grid_btn.config(bg=self.colors['accent_blue'], fg=self.colors['text_primary'])
+            self.list_btn.config(bg=self.colors['bg_card'], fg=self.colors['text_secondary'])
+        self.display()
+    
+    def fetch_game_image(self, game_name, image_type="icon"):
+        """Fetch high-quality icons and covers with better non-Steam game support"""
+        # Check cache first
+        cache_key = f"{game_name}_{image_type}"
+        if cache_key in self.image_cache:
+            return self.image_cache[cache_key]
+        
+        try:
+            import requests
+            from io import BytesIO
+            from PIL import Image, ImageTk
+            import urllib.parse
+            
+            # Clean game name
+            clean_name = game_name.replace('™', '').replace('®', '').replace('©', '').strip()
+            clean_name = clean_name.replace(':', '').replace('  ', ' ')
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            image_urls = []
+            
+            print(f"🔍 Searching for images: {clean_name}")
+            
+            # ===== METHOD 1: Steam Community (BEST quality for Steam games) =====
+            try:
+                steam_search = clean_name.lower().replace(' ', '%20')
+                steam_url = f"https://steamcommunity.com/actions/SearchApps/{steam_search}"
+                
+                response = requests.get(steam_url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    steam_data = response.json()
+                    if steam_data and len(steam_data) > 0:
+                        app_id = steam_data[0].get('appid')
+                        if app_id:
+                            print(f"✓ Found Steam App ID: {app_id}")
+                            
+                            if image_type == "icon":
+                                # PRIORITY ORDER: Best quality icons first!
+                                # 1. Library capsule (best quality, large)
+                                image_urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/capsule_184x69.jpg")
+                                image_urls.append(f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/capsule_231x87.jpg")
+                                # 2. Logo from community (high quality)
+                                logo = steam_data[0].get('logo', '')
+                                if logo:
+                                    image_urls.append(f"https://cdn.cloudflare.steamstatic.com/steamcommunity/public/images/apps/{app_id}/{logo}.jpg")
+                                # 3. Header (good fallback)
+                                image_urls.append(f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/header.jpg")
+                            else:
+                                # For covers, get highest quality available
+                                image_urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/library_600x900_2x.jpg")
+                                image_urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/library_600x900.jpg")
+                                image_urls.append(f"https://cdn.cloudflare.steamstatic.com/steam/apps/{app_id}/library_hero.jpg")
+                                image_urls.append(f"https://cdn.akamai.steamstatic.com/steam/apps/{app_id}/header.jpg")
+                
+            except Exception as e:
+                print(f"  Steam search error: {e}")
+            
+            # ===== METHOD 2: RAWG API (Good for non-Steam games) =====
+            if not image_urls or len(image_urls) == 0:
+                try:
+                    # RAWG has good coverage for all platforms
+                    rawg_search = clean_name.lower().replace(' ', '-').replace("'", "")
+                    rawg_url = f"https://api.rawg.io/api/games/{rawg_search}"
+                    
+                    response = requests.get(rawg_url, headers=headers, timeout=5)
+                    if response.status_code == 200:
+                        rawg_data = response.json()
+                        
+                        # Get background image (usually high quality)
+                        bg_image = rawg_data.get('background_image')
+                        if bg_image:
+                            print(f"✓ Found RAWG image")
+                            image_urls.append(bg_image)
+                        
+                        # Get additional background
+                        bg_add = rawg_data.get('background_image_additional')
+                        if bg_add:
+                            image_urls.append(bg_add)
+                    else:
+                        # Try with spaces instead of dashes
+                        rawg_search2 = clean_name.lower().replace(' ', '%20')
+                        rawg_url2 = f"https://api.rawg.io/api/games?search={rawg_search2}"
+                        
+                        response2 = requests.get(rawg_url2, headers=headers, timeout=5)
+                        if response2.status_code == 200:
+                            rawg_data2 = response2.json()
+                            results = rawg_data2.get('results', [])
+                            if results and len(results) > 0:
+                                print(f"✓ Found RAWG game via search")
+                                bg_image = results[0].get('background_image')
+                                if bg_image:
+                                    image_urls.append(bg_image)
+                        
+                except Exception as e:
+                    print(f"  RAWG search error: {e}")
+            
+            # ===== METHOD 3: Epic Games Store (for Epic games) =====
+            if not image_urls and any(x in game_name.lower() for x in ['fortnite', 'rocket league', 'fall guys']):
+                try:
+                    # Common Epic Games images
+                    epic_game_ids = {
+                        'fortnite': 'fortnite',
+                        'rocket league': 'sugar',
+                        'fall guys': 'fallguys'
+                    }
+                    
+                    for game_key, game_id in epic_game_ids.items():
+                        if game_key in clean_name.lower():
+                            print(f"✓ Detected Epic game: {game_key}")
+                            # Epic CDN URLs
+                            if image_type == "icon":
+                                image_urls.append(f"https://cdn2.unrealengine.com/{game_id}-logo.png")
+                            image_urls.append(f"https://cdn2.unrealengine.com/{game_id}-keyart.jpg")
+                            break
+                            
+                except Exception as e:
+                    print(f"  Epic search error: {e}")
+            
+            # ===== METHOD 4: Special handling for known games =====
+            if not image_urls:
+                try:
+                    game_lower = clean_name.lower()
+                    
+                    # Marvel Rivals
+                    if 'marvel' in game_lower and 'rivals' in game_lower:
+                        print(f"✓ Detected Marvel Rivals")
+                        image_urls.append("https://cdn.marvel.com/content/1x/marvrivals_lob_crd_01.jpg")
+                        image_urls.append("https://www.marvelrivals.com/images/share-en.jpg")
+                    
+                    # Valorant
+                    elif 'valorant' in game_lower:
+                        print(f"✓ Detected Valorant")
+                        image_urls.append("https://images.contentstack.io/v3/assets/bltb6530b271fddd0b1/blt5c61cf2eb38b3d53/5eb26f413b2d42079e84200a/V_AGENTS_587x900_Jett.png")
+                        image_urls.append("https://playvalorant.com/assets/images/valorant-logo.png")
+                    
+                    # League of Legends
+                    elif 'league' in game_lower and 'legends' in game_lower:
+                        print(f"✓ Detected League of Legends")
+                        image_urls.append("https://lolstatic-a.akamaihd.net/frontpage/apps/prod/rg-league-display-2021/en_US/5f0f4e0d0ee3a67f3a7e5fa54e7ef20bdc0c7143/assets/images/logo.png")
+                    
+                    # Overwatch
+                    elif 'overwatch' in game_lower:
+                        print(f"✓ Detected Overwatch")
+                        image_urls.append("https://blz-contentstack-images.akamaized.net/v3/assets/blt9c12f249ac15c7ec/blt5a6b396c54b2b7b5/634f89c4e6d60c106d533909/ow-logo.png")
+                    
+                except Exception as e:
+                    print(f"  Special handling error: {e}")
+            
+            # ===== Try to download and process images =====
+            if not image_urls:
+                print(f"✗ No image sources found for '{game_name}'")
+                return None
+            
+            print(f"  Found {len(image_urls)} potential image sources")
+            
+            for idx, source_url in enumerate(image_urls):
+                try:
+                    print(f"  → Trying source {idx+1}/{len(image_urls)}: {source_url[:70]}...")
+                    img_response = requests.get(source_url, timeout=10, headers=headers)
+                    
+                    if img_response.status_code == 200 and len(img_response.content) > 500:
+                        # Valid image data
+                        img_data = BytesIO(img_response.content)
+                        img = Image.open(img_data)
+                        
+                        # Convert to RGB if needed (some PNGs have alpha)
+                        if img.mode in ('RGBA', 'LA', 'P'):
+                            # Create white background
+                            background = Image.new('RGB', img.size, (255, 255, 255))
+                            if img.mode == 'P':
+                                img = img.convert('RGBA')
+                            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                            img = background
+                        
+                        # Resize based on type - LARGER for better quality!
+                        if image_type == "icon":
+                            # Make icons nice and large (80x80 instead of 60x60)
+                            img = img.resize((80, 80), Image.Resampling.LANCZOS)
+                        else:
+                            # Cover - maintain aspect ratio
+                            img.thumbnail((230, 345), Image.Resampling.LANCZOS)
+                        
+                        photo = ImageTk.PhotoImage(img)
+                        self.image_cache[cache_key] = photo
+                        print(f"✓ Successfully loaded HIGH-QUALITY image for '{game_name}'")
+                        return photo
+                        
+                except Exception as e:
+                    print(f"  ✗ Failed: {str(e)[:50]}")
+                    continue
+            
+            # No images worked
+            print(f"✗ All image sources failed for '{game_name}'")
+            return None
+            
+        except Exception as e:
+            print(f"✗ Error in fetch_game_image for '{game_name}': {e}")
+            return None
 
     # ---------- scanning / UI helpers ----------
     def scan(self):
-        self.status.config(text="🔄 Scanning all drives for games...", fg="#60a5fa")
+        self.status.config(text="Scanning all drives for games...", fg="#60a5fa")
         self.root.update()
         threading.Thread(target=self._do_scan, daemon=True).start()
 
@@ -1403,9 +1890,9 @@ class GUI:
         self.filtered = self.games.copy()
         manual_count = len([g for g in self.games if g.platform == "Other"])
         if manual_count > 0:
-            self.status.config(text=f"✅ Found {len(self.games)} games ({manual_count} manually added)", fg="#10b981")
+            self.status.config(text=f"Found {len(self.games)} games ({manual_count} manually added)", fg="#10b981")
         else:
-            self.status.config(text=f"✅ Found {len(self.games)} games across all platforms", fg="#10b981")
+            self.status.config(text=f"Found {len(self.games)} games across all platforms", fg="#10b981")
         self.display()
         # Auto-start monitor after scan if Twitch is authenticated
         self.root.after(500, self.auto_start_monitor)
@@ -1416,7 +1903,7 @@ class GUI:
         
         # If no games loaded yet, show a helpful message
         if not self.games:
-            self.status.config(text="⚠️ No games loaded - please scan first!", fg="#f59e0b")
+            self.status.config(text="No games loaded - please scan first!", fg="#f59e0b")
             self.filtered = []
             self.display()
             return
@@ -1429,79 +1916,362 @@ class GUI:
             total = len(self.games)
             found = len(self.filtered)
             if found == 0:
-                self.status.config(text=f"🔍 No games match your search (0/{total})", fg="#f59e0b")
+                self.status.config(text=f"No games match your search (0/{total})", fg="#f59e0b")
             else:
-                self.status.config(text=f"🔍 Showing {found} of {total} games", fg="#60a5fa")
+                self.status.config(text=f"Showing {found} of {total} games", fg="#60a5fa")
         else:
-            self.status.config(text=f"✅ Showing all {len(self.games)} games", fg="#10b981")
+            self.status.config(text=f"Showing all {len(self.games)} games", fg="#10b981")
         
         self.display()
 
     def display(self):
         for w in self.games_frame.winfo_children():
             w.destroy()
-        # --- self.game_images removed ---
+        # Don't clear image_cache here - keep images cached
         gc.collect()
         
         if not self.filtered:
-            empty_frame = tk.Frame(self.games_frame, bg="#0a0e27")
+            empty_frame = tk.Frame(self.games_frame, bg=self.colors['bg_dark'])
             empty_frame.pack(expand=True, fill="both", pady=100)
-            tk.Label(empty_frame, text="📂", font=("Segoe UI", 64), bg="#0a0e27", fg="#374151").pack()
-            tk.Label(empty_frame, text="No games found", font=("Segoe UI", 16, "bold"), bg="#0a0e27", fg="#6b7280").pack(pady=(10, 5))
-            tk.Label(empty_frame, text="Click 'Scan' to discover your games", font=("Segoe UI", 11), bg="#0a0e27", fg="#4b5563").pack()
+            
+            # Smooth empty state
+            tk.Label(empty_frame, text="No games found", font=("Segoe UI", 24, "bold"),
+                    bg=self.colors['bg_dark'], fg=self.colors['text_primary']).pack(pady=(0, 12))
+            tk.Label(empty_frame, text="Click 'Scan' to discover your games",
+                    font=("Segoe UI", 12), bg=self.colors['bg_dark'],
+                    fg=self.colors['text_secondary']).pack()
             return
-        colors = {"Steam": "#1b2838", "Epic Games": "#000000", "GOG": "#86328a", "EA/Origin": "#f56300", "Riot Games": "#d13639", "Xbox": "#107c10", "Battle.net": "#148eff"}
+        
+        if self.view_mode.get() == "grid":
+            self.display_grid()
+        else:
+            self.display_list()
+    
+    def show_modern_dialog(self, title, message, dialog_type="info", callback=None):
+        """Create a smooth modern custom dialog"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(title)
+        dialog.geometry("500x300")
+        dialog.resizable(False, False)
+        dialog.configure(bg=self.colors['bg_dark'])
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Colors based on type (no emojis)
+        type_colors = {
+            "info": self.colors['accent_blue'],
+            "warning": self.colors['accent_orange'],
+            "error": self.colors['accent_red'],
+            "success": self.colors['accent_green'],
+            "question": self.colors['accent_purple']
+        }
+        
+        accent_color = type_colors.get(dialog_type, type_colors["info"])
+        
+        # Smooth header with accent color
+        header = tk.Frame(dialog, bg=accent_color, height=90)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        
+        tk.Label(header, text=title, font=("Segoe UI", 18, "bold"),
+                bg=accent_color, fg=self.colors['text_primary']).pack(expand=True)
+        
+        # Content area
+        content = tk.Frame(dialog, bg=self.colors['bg_dark'])
+        content.pack(fill="both", expand=True, padx=40, pady=30)
+        
+        tk.Label(content, text=message, font=("Segoe UI", 11),
+                bg=self.colors['bg_dark'], fg=self.colors['text_secondary'],
+                wraplength=420, justify="center").pack()
+        
+        # Button frame
+        btn_frame = tk.Frame(dialog, bg=self.colors['bg_dark'])
+        btn_frame.pack(pady=(0, 25))
+        
+        if dialog_type == "question":
+            # Yes/No buttons
+            def on_yes():
+                dialog.destroy()
+                if callback:
+                    callback(True)
+            
+            def on_no():
+                dialog.destroy()
+                if callback:
+                    callback(False)
+            
+            tk.Button(btn_frame, text="Yes", command=on_yes,
+                     font=("Segoe UI", 11, "bold"), bg=self.colors['accent_green'],
+                     fg=self.colors['text_primary'], relief="flat", padx=35, pady=12,
+                     cursor="hand2", borderwidth=0).pack(side="left", padx=6)
+            
+            tk.Button(btn_frame, text="No", command=on_no,
+                     font=("Segoe UI", 11), bg=self.colors['bg_card'],
+                     fg=self.colors['text_primary'], relief="flat", padx=35, pady=12,
+                     cursor="hand2", borderwidth=0).pack(side="left", padx=6)
+        else:
+            # OK button
+            tk.Button(btn_frame, text="OK", command=dialog.destroy,
+                     font=("Segoe UI", 11, "bold"), bg=accent_color,
+                     fg=self.colors['text_primary'], relief="flat", padx=45, pady=12,
+                     cursor="hand2", borderwidth=0).pack()
+        
+        # Center dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (dialog.winfo_width() // 2)
+        y = (dialog.winfo_screenheight() // 2) - (dialog.winfo_height() // 2)
+        dialog.geometry(f"+{x}+{y}")
+    
+    def display_grid(self):
+        """Display games in grid view with smooth, rounded card styling"""
+        # Calculate columns based on window width
+        cols = 5  # Default 5 columns
+        
+        platform_colors = {
+            "Steam": "#2563eb",
+            "Epic Games": "#0ea5e9",
+            "GOG": "#a855f7",
+            "Riot Games": "#ef4444",
+            "Xbox": "#10b981",
+            "Battle.net": "#0891b2",
+            "Other": "#6b7280"
+        }
+        
+        row_frame = None
+        for idx, game in enumerate(self.filtered):
+            if idx % cols == 0:
+                row_frame = tk.Frame(self.games_frame, bg=self.colors['bg_dark'])
+                row_frame.pack(fill="x", pady=10, padx=10)
+            
+            # Card container with smooth, soft shadow effect
+            card_container = tk.Frame(row_frame, bg=self.colors['bg_dark'])
+            card_container.pack(side="left", padx=10, pady=10)
+            
+            # Main card with smooth, rounded styling (no harsh borders)
+            card = tk.Frame(card_container, bg=self.colors['bg_card'], 
+                           highlightthickness=0,
+                           width=230, height=370)
+            card.pack()
+            card.pack_propagate(False)
+            
+            # Image container with smooth background
+            img_frame = tk.Frame(card, bg=self.colors['bg_hover'], width=220, height=310)
+            img_frame.pack(padx=5, pady=5)
+            img_frame.pack_propagate(False)
+            
+            # Try to fetch cover with proper caching
+            def load_cover(g=game, frame=img_frame):
+                try:
+                    photo = self.fetch_game_image(g.name, "cover")
+                    if photo:
+                        # Schedule UI update on main thread
+                        self.root.after(0, lambda p=photo, f=frame: self._update_cover(p, f))
+                    else:
+                        # Fallback: show game name with smooth gradient background
+                        self.root.after(0, lambda: self._create_fallback_cover(g, frame))
+                except Exception:
+                    # On error, create fallback
+                    self.root.after(0, lambda: self._create_fallback_cover(g, frame))
+            
+            # Load image in background
+            threading.Thread(target=load_cover, daemon=True).start()
+            
+            # Info section below image
+            info_frame = tk.Frame(card, bg=self.colors['bg_card'])
+            info_frame.pack(fill="x", padx=10, pady=(0, 10))
+            
+            # Game name (truncated if too long)
+            name_text = game.name[:30] + "..." if len(game.name) > 30 else game.name
+            name_label = tk.Label(info_frame, text=name_text,
+                                 font=("Segoe UI", 10, "bold"), bg=self.colors['bg_card'],
+                                 fg=self.colors['text_primary'], anchor="w")
+            name_label.pack(fill="x", pady=(0, 6))
+            
+            # Platform badge with smooth rounded color
+            accent_color = platform_colors.get(game.platform, self.colors['border'])
+            badge = tk.Label(info_frame, text=game.platform, font=("Segoe UI", 8, "bold"),
+                           bg=accent_color, fg=self.colors['text_primary'], 
+                           padx=10, pady=4)
+            badge.pack(anchor="w")
+            
+            # Add smooth hover effects to card
+            def on_enter(e, c=card):
+                c.config(bg=self.colors['bg_hover'])
+                info_frame.config(bg=self.colors['bg_hover'])
+                name_label.config(bg=self.colors['bg_hover'])
+            
+            def on_leave(e, c=card):
+                c.config(bg=self.colors['bg_card'])
+                info_frame.config(bg=self.colors['bg_card'])
+                name_label.config(bg=self.colors['bg_card'])
+            
+            card.bind("<Enter>", on_enter)
+            card.bind("<Leave>", on_leave)
+    
+    def _update_cover(self, photo, frame):
+        """Update cover image on main thread"""
+        for widget in frame.winfo_children():
+            widget.destroy()
+        label = tk.Label(frame, image=photo, bg=self.colors['bg_hover'])
+        label.pack(expand=True)
+    
+    def _create_fallback_cover(self, game, frame):
+        """Create fallback cover when image fetch fails"""
+        for widget in frame.winfo_children():
+            widget.destroy()
+        
+        # Create a nice gradient-like fallback with game initial
+        fallback_frame = tk.Frame(frame, bg=self.colors['bg_medium'])
+        fallback_frame.pack(expand=True, fill="both")
+        
+        # Game initial in large font
+        initial = tk.Label(fallback_frame, text=game.name[0].upper(),
+                          font=("Segoe UI", 72, "bold"),
+                          bg=self.colors['bg_medium'], fg=self.colors['accent_purple'])
+        initial.pack(expand=True)
+        
+        # Game name at bottom
+        name_text = game.name[:20] + "..." if len(game.name) > 20 else game.name
+        name_label = tk.Label(fallback_frame, text=name_text,
+                             font=("Segoe UI", 10, "bold"), 
+                             bg=self.colors['bg_medium'],
+                             fg=self.colors['text_primary'], wraplength=190)
+        name_label.pack(side="bottom", pady=10)
+    
+    def display_list(self):
+        """Display games in list view with smooth, rounded styling and HIGH-QUALITY icons"""
+        platform_colors = {
+            "Steam": "#2563eb",
+            "Epic Games": "#0ea5e9",
+            "GOG": "#a855f7",
+            "Riot Games": "#ef4444",
+            "Xbox": "#10b981",
+            "Battle.net": "#0891b2",
+            "Other": "#6b7280"
+        }
+        
         for game in self.filtered:
-            card = tk.Frame(self.games_frame, bg="#0a0e27")
-            card.pack(fill="x", pady=6)
-            card_frame = tk.Frame(card, bg="#151b2e", highlightthickness=1, highlightbackground="#1f2937")
-            card_frame.pack(fill="x")
-            accent = tk.Frame(card_frame, bg=colors.get(game.platform, "#4b5563"), width=5)
+            # Outer container for smooth shadow effect
+            card = tk.Frame(self.games_frame, bg=self.colors['bg_dark'])
+            card.pack(fill="x", pady=4, padx=6)
+            
+            # Inner card with smooth rounded feel (no harsh borders)
+            card_inner = tk.Frame(card, bg=self.colors['bg_card'], 
+                                 highlightthickness=0)
+            card_inner.pack(fill="x")
+            
+            # Platform accent bar (smooth, slightly thicker)
+            accent_color = platform_colors.get(game.platform, self.colors['border'])
+            accent = tk.Frame(card_inner, bg=accent_color, width=5)
             accent.pack(side="left", fill="y")
             
-            # --- Icon display logic completely removed ---
+            # Icon container - LARGER for better quality icons (80x80)
+            icon_frame = tk.Frame(card_inner, bg=self.colors['bg_hover'], width=80, height=80)
+            icon_frame.pack(side="left", padx=18, pady=18)
+            icon_frame.pack_propagate(False)
             
-            content = tk.Frame(card_frame, bg="#151b2e")
-            # --- Added padx=20 to 'content' frame to replace spacing from deleted icon ---
-            content.pack(side="left", fill="both", expand=True, padx=20, pady=16)
-            tk.Label(content, text=game.name, font=("Segoe UI", 13, "bold"), bg="#151b2e", fg="#f3f4f6", anchor="w").pack(anchor="w")
-            details = tk.Frame(content, bg="#151b2e")
-            details.pack(anchor="w", pady=(6, 0))
-            badge = tk.Label(details, text=game.platform, font=("Segoe UI", 8, "bold"), bg=colors.get(game.platform, "#4b5563"), fg="#ffffff", padx=10, pady=3)
+            # Try to fetch HIGH-QUALITY icon with proper caching
+            def load_icon(g=game, frame=icon_frame, accent_col=accent_color):
+                try:
+                    photo = self.fetch_game_image(g.name, "icon")
+                    if photo:
+                        # Schedule UI update on main thread
+                        self.root.after(0, lambda p=photo, f=frame: self._update_icon(p, f))
+                    else:
+                        # Fallback: show first letter with smooth background
+                        self.root.after(0, lambda: self._create_fallback_icon(g, frame, accent_col))
+                except Exception as e:
+                    # On error, create fallback
+                    self.root.after(0, lambda: self._create_fallback_icon(g, frame, accent_col))
+            
+            # Load icon in background
+            threading.Thread(target=load_icon, daemon=True).start()
+            
+            # Content section
+            content = tk.Frame(card_inner, bg=self.colors['bg_card'])
+            content.pack(side="left", fill="both", expand=True, padx=24, pady=18)
+            
+            # Game name with smooth, larger font
+            tk.Label(content, text=game.name, font=("Segoe UI", 13, "bold"),
+                    bg=self.colors['bg_card'], fg=self.colors['text_primary'],
+                    anchor="w").pack(anchor="w")
+            
+            # Details row
+            details = tk.Frame(content, bg=self.colors['bg_card'])
+            details.pack(anchor="w", pady=(8, 0))
+            
+            # Platform badge with smooth rounded corners effect
+            badge = tk.Label(details, text=f"  {game.platform}  ", font=("Segoe UI", 9, "bold"),
+                           bg=accent_color, fg=self.colors['text_primary'],
+                           padx=12, pady=5)
             badge.pack(side="left", padx=(0, 12))
             
-            # --- Game destination path (path_text) label removed ---
+            # Path info (shortened)
+            path_text = game.path if len(game.path) < 60 else "..." + game.path[-57:]
+            tk.Label(details, text=path_text, font=("Segoe UI", 9),
+                    bg=self.colors['bg_card'], fg=self.colors['text_secondary']).pack(side="left")
             
-            remove_btn = tk.Button(card_frame, text="✕", command=lambda g=game: self.remove(g), font=("Segoe UI", 12, "bold"), bg="#ef4444", fg="#ffffff", activebackground="#dc2626", relief="flat", padx=16, pady=8, cursor="hand2", borderwidth=0)
-            remove_btn.pack(side="right", padx=16, pady=12)
+            # Remove button with smooth styling
+            remove_btn = tk.Button(card_inner, text="✕", command=lambda g=game: self.remove(g),
+                                  font=("Segoe UI", 12, "bold"), bg=self.colors['accent_red'],
+                                  fg=self.colors['text_primary'], activebackground="#dc2626",
+                                  relief="flat", padx=18, pady=12, cursor="hand2", borderwidth=0)
+            remove_btn.pack(side="right", padx=18, pady=15)
+            
+            # Add smooth hover effect
+            def on_enter(e):
+                card_inner.config(bg=self.colors['bg_hover'])
+                content.config(bg=self.colors['bg_hover'])
+                for child in details.winfo_children():
+                    if isinstance(child, tk.Label) and child != badge:
+                        child.config(bg=self.colors['bg_hover'])
+            
+            def on_leave(e):
+                card_inner.config(bg=self.colors['bg_card'])
+                content.config(bg=self.colors['bg_card'])
+                for child in details.winfo_children():
+                    if isinstance(child, tk.Label) and child != badge:
+                        child.config(bg=self.colors['bg_card'])
+            
+            card_inner.bind("<Enter>", on_enter)
+            card_inner.bind("<Leave>", on_leave)
+    
+    def _update_icon(self, photo, frame):
+        """Update icon on main thread"""
+        for widget in frame.winfo_children():
+            widget.destroy()
+        label = tk.Label(frame, image=photo, bg=self.colors['bg_hover'])
+        label.pack(expand=True)
+    
+    def _create_fallback_icon(self, game, frame, accent_color):
+        """Create fallback icon when image fetch fails - larger size for better appearance"""
+        for widget in frame.winfo_children():
+            widget.destroy()
+        fallback = tk.Label(frame, text=game.name[0].upper(),
+                          font=("Segoe UI", 24, "bold"),  # Larger font for 80x80 icon
+                          bg=accent_color, fg=self.colors['text_primary'])
+        fallback.pack(expand=True, fill="both")
 
     def remove(self, game):
-        if messagebox.askyesno("Remove Game", f"Remove '{game.name}' from library?"):
-            self.scanner.exclude(game.name)
-            self.games = [g for g in self.games if g.name != game.name]
-            self.filtered = [g for g in self.filtered if g.name != game.name]
-            self.save_cache()
-            self.display()
-            self.status.config(text=f"❌ Removed {game.name}", fg="#f59e0b")
+        def on_confirm(result):
+            if result:
+                self.scanner.exclude(game.name)
+                self.games = [g for g in self.games if g.name != game.name]
+                self.filtered = [g for g in self.filtered if g.name != game.name]
+                self.save_cache()
+                self.display()
+                self.status.config(text=f"✓ Removed {game.name}", fg=self.colors['accent_orange'])
+        
+        self.show_modern_dialog(
+            "Remove Game",
+            f"Are you sure you want to remove '{game.name}' from your library?",
+            "question",
+            on_confirm
+        )
 
-    def toggle_monitor(self):
-        if self.monitor and self.monitor.active:
-            self.monitor.stop()
-            self.monitor = None
-            self.monitor_btn.config(text="⚪ Monitor", bg="#10b981")
-            self.status.config(text="Monitor stopped", fg="#6b7280")
-        else:
-            if not self.games:
-                messagebox.showwarning("No Games", "Please scan for games first!")
-                return
-            self.monitor = GameMonitor(self.games, self.twitch, self.update_status)
-            self.monitor.start()
-            self.monitor_btn.config(text="🟢 Active", bg="#ef4444")
-            self.status.config(text="🔴 Monitoring active - detecting game launches", fg="#10b981")
-    
     def auto_start_monitor(self):
-        """Automatically start monitor if Twitch is authenticated and games are loaded"""
-        # Only auto-start if:
+        """Automatically start monitor if Twitch is authenticated (always on)"""
+        # Auto-start if:
         # 1. Twitch is authenticated and enabled
         # 2. Games have been loaded (from cache or scan)
         # 3. Monitor is not already running
@@ -1509,13 +2279,14 @@ class GUI:
             try:
                 self.monitor = GameMonitor(self.games, self.twitch, self.update_status)
                 self.monitor.start()
-                self.monitor_btn.config(text="🟢 Active", bg="#ef4444")
                 
                 # Show different message based on startup mode
                 if STARTUP_MODE:
-                    self.status.config(text="✅ Auto-monitoring started (Twitch authenticated)", fg="#10b981")
+                    self.status.config(text="● Auto-monitoring active (Twitch authenticated)", 
+                                     fg=self.colors['accent_green'])
                 else:
-                    self.status.config(text="✅ Auto-monitoring started - Twitch is ready!", fg="#10b981")
+                    self.status.config(text="● Monitoring active - Game launches will update Twitch", 
+                                     fg=self.colors['accent_green'])
             except Exception as e:
                 # Silently fail if auto-start doesn't work
                 pass
@@ -1527,51 +2298,132 @@ class GUI:
     def twitch_settings(self):
         dialog = tk.Toplevel(self.root)
         dialog.title("Twitch Settings")
-        dialog.geometry("550x400")
-        dialog.configure(bg="#0f1629")
+        dialog.geometry("600x500")
+        dialog.resizable(False, False)
+        dialog.configure(bg=self.colors['bg_dark'])
         dialog.transient(self.root)
         dialog.grab_set()
-        tk.Label(dialog, text="📡 Twitch Integration", font=("Segoe UI", 18, "bold"), bg="#0f1629", fg="#60a5fa").pack(pady=20)
-        tk.Label(dialog, text="Automatically changes your stream category when you launch games", font=("Segoe UI", 10), bg="#0f1629", fg="#9ca3af", justify="center", wraplength=450).pack(pady=10)
-        form = tk.Frame(dialog, bg="#0f1629")
-        form.pack(pady=20, padx=40)
-        tk.Label(form, text="Channel Name:", bg="#0f1629", fg="#ffffff", font=("Segoe UI", 11)).grid(row=0, column=0, sticky="w", pady=15)
-        channel_entry = tk.Entry(form, font=("Segoe UI", 11), bg="#1a1f3a", fg="#ffffff", width=30, borderwidth=0, relief="flat")
-        channel_entry.grid(row=0, column=1, pady=15, ipady=8, padx=10)
+        
+        # Smooth header with accent color
+        header = tk.Frame(dialog, bg="#9146ff", height=100)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        
+        tk.Label(header, text="Twitch Integration", font=("Segoe UI", 20, "bold"),
+                bg="#9146ff", fg=self.colors['text_primary']).pack(expand=True)
+        
+        # Description
+        desc_frame = tk.Frame(dialog, bg=self.colors['bg_dark'])
+        desc_frame.pack(pady=20)
+        tk.Label(desc_frame, 
+                text="Automatically changes your stream category when you launch games",
+                font=("Segoe UI", 11), bg=self.colors['bg_dark'],
+                fg=self.colors['text_secondary'], justify="center",
+                wraplength=520).pack()
+        
+        # Form container with smooth styling
+        form_container = tk.Frame(dialog, bg=self.colors['bg_card'],
+                                 highlightthickness=0)
+        form_container.pack(pady=25, padx=50, fill="x")
+        
+        form = tk.Frame(form_container, bg=self.colors['bg_card'])
+        form.pack(padx=30, pady=30)
+        
+        # Channel name field
+        tk.Label(form, text="Channel Name:", bg=self.colors['bg_card'],
+                fg=self.colors['text_primary'], font=("Segoe UI", 11, "bold")).grid(
+                row=0, column=0, sticky="w", pady=(0, 10))
+        
+        channel_entry = tk.Entry(form, font=("Segoe UI", 12),
+                                bg=self.colors['bg_medium'],
+                                fg=self.colors['text_primary'], width=40,
+                                borderwidth=0, relief="flat",
+                                highlightthickness=0,
+                                insertbackground=self.colors['accent_blue'])
+        channel_entry.grid(row=1, column=0, pady=(0, 25), ipady=12, padx=5)
         channel_entry.insert(0, self.twitch.config.get('channel_name', ''))
+        
+        # Enable checkbox with smooth styling
         enabled_var = tk.BooleanVar(value=self.twitch.config.get('enabled', False))
-        tk.Checkbutton(form, text="Enable automatic category changes", variable=enabled_var, font=("Segoe UI", 10), bg="#0f1629", fg="#ffffff", selectcolor="#1a1f3a", activebackground="#0f1629", activeforeground="#ffffff").grid(row=1, column=0, columnspan=2, pady=15)
-        btn_frame = tk.Frame(dialog, bg="#0f1629")
-        btn_frame.pack(pady=20)
+        check_frame = tk.Frame(form, bg=self.colors['bg_card'])
+        check_frame.grid(row=2, column=0, pady=20, sticky="w")
+        
+        tk.Checkbutton(check_frame, text="Enable automatic category changes",
+                      variable=enabled_var, font=("Segoe UI", 10),
+                      bg=self.colors['bg_card'], fg=self.colors['text_primary'],
+                      selectcolor=self.colors['bg_medium'],
+                      activebackground=self.colors['bg_card'],
+                      activeforeground=self.colors['text_primary'],
+                      cursor="hand2").pack(side="left")
+        
+        # Buttons with smooth styling
+        btn_frame = tk.Frame(dialog, bg=self.colors['bg_dark'])
+        btn_frame.pack(pady=30)
 
         def authenticate():
             channel = channel_entry.get().strip()
             if not channel:
-                messagebox.showwarning("Missing Info", "Enter your Twitch channel name!")
+                self.show_modern_dialog(
+                    "Missing Information",
+                    "Please enter your Twitch channel name!",
+                    "warning"
+                )
                 return
             self.twitch.update_config(channel, True)
-            auth_btn.config(text="Authenticating...", state="disabled")
+            auth_btn.config(text="Authenticating...", state="disabled", bg=self.colors['bg_medium'])
             dialog.update()
+            
             def do_auth():
                 ok = self.twitch.authenticate() and self.twitch.get_user_id()
-                self.root.after(0, lambda: auth_btn.config(text="🔐 Authenticate", state="normal"))
+                self.root.after(0, lambda: auth_btn.config(
+                    text="Authenticate", state="normal", bg="#9146ff"))
                 if ok:
+                    self.root.after(0, lambda: self.show_modern_dialog(
+                        "Success",
+                        "Successfully authenticated with Twitch!",
+                        "success"
+                    ))
+                    # Auto-start monitoring after successful authentication
+                    self.root.after(100, self.auto_start_monitor)
                     dialog.destroy()
                 else:
-                    self.root.after(0, lambda: messagebox.showerror("Failed", "❌ Authentication failed!\n\nPlease try again."))
+                    self.root.after(0, lambda: self.show_modern_dialog(
+                        "Authentication Failed",
+                        "Could not authenticate with Twitch. Please try again.",
+                        "error"
+                    ))
 
             threading.Thread(target=do_auth, daemon=True).start()
 
-        auth_btn = tk.Button(btn_frame, text="🔐 Authenticate", command=authenticate, font=("Segoe UI", 11, "bold"), bg="#9146ff", fg="#ffffff", relief="flat", padx=25, pady=10, cursor="hand2", borderwidth=0)
-        auth_btn.pack(side="left", padx=5)
+        auth_btn = tk.Button(btn_frame, text="Authenticate", command=authenticate,
+                           font=("Segoe UI", 11, "bold"), bg="#9146ff",
+                           fg=self.colors['text_primary'], relief="flat",
+                           padx=28, pady=14, cursor="hand2", borderwidth=0)
+        auth_btn.pack(side="left", padx=6)
 
         def save():
             self.twitch.update_config(channel_entry.get().strip(), enabled_var.get())
+            self.show_modern_dialog(
+                "Settings Saved",
+                "Your Twitch settings have been saved successfully!",
+                "success"
+            )
             dialog.destroy()
 
-        tk.Button(btn_frame, text="💾 Save", command=save, font=("Segoe UI", 11, "bold"), bg="#3b82f6", fg="#ffffff", relief="flat", padx=30, pady=10, cursor="hand2", borderwidth=0).pack(side="left", padx=5)
-        tk.Button(btn_frame, text="Cancel", command=dialog.destroy, font=("Segoe UI", 11), bg="#374151", fg="#ffffff", relief="flat", padx=30, pady=10, cursor="hand2", borderwidth=0).pack(side="left", padx=5)
-        tk.Label(dialog, text="💡 Click 'Authenticate' to login with Twitch (opens browser)", font=("Segoe UI", 9), bg="#0f1629", fg="#6b7280").pack(pady=(0, 10))
+        tk.Button(btn_frame, text="Save", command=save,
+                 font=("Segoe UI", 11, "bold"), bg=self.colors['accent_blue'],
+                 fg=self.colors['text_primary'], relief="flat",
+                 padx=32, pady=14, cursor="hand2", borderwidth=0).pack(side="left", padx=6)
+        
+        tk.Button(btn_frame, text="Cancel", command=dialog.destroy,
+                 font=("Segoe UI", 11), bg=self.colors['bg_card'],
+                 fg=self.colors['text_primary'], relief="flat",
+                 padx=32, pady=14, cursor="hand2", borderwidth=0).pack(side="left", padx=6)
+        
+        # Footer hint (no emoji)
+        tk.Label(dialog, text="Click 'Authenticate' to login with Twitch (opens browser)",
+                font=("Segoe UI", 9), bg=self.colors['bg_dark'],
+                fg=self.colors['text_secondary']).pack(pady=(0, 20))
 
     def add_manual_game(self):
         """Manual game adder dialog"""
@@ -1667,7 +2519,7 @@ class GUI:
                 self.monitor.games = self.games
                 self.monitor.build_exe_map()
             
-            self.status.config(text=f"✅ Added '{name}' to your library", fg="#10b981")
+            self.status.config(text=f"Added '{name}' to your library", fg="#10b981")
             dialog.destroy()
         
         tk.Button(btn_frame, text="➕ Add Game", command=add_game, font=("Segoe UI", 11, "bold"), bg="#8b5cf6", fg="#ffffff", relief="flat", padx=25, pady=10, cursor="hand2", borderwidth=0).pack(side="left", padx=5)
@@ -1704,7 +2556,7 @@ class GUI:
             def restore_game(name=game_name):
                 if messagebox.askyesno("Restore Game", f"Restore '{name}' to your library?\n\nYou'll need to rescan to see it."):
                     if self.scanner.unexclude(name):
-                        self.status.config(text=f"✅ Restored {name} - please rescan", fg="#10b981")
+                        self.status.config(text=f"Restored {name} - please rescan", fg="#10b981")
                         dialog.destroy()
                         self.show_excluded_games()
             tk.Button(item_frame, text="↩️ Restore", command=restore_game, font=("Segoe UI", 9, "bold"), bg="#10b981", fg="#ffffff", activebackground="#059669", relief="flat", padx=15, pady=6, cursor="hand2", borderwidth=0).pack(side="right", padx=10)
@@ -1729,7 +2581,7 @@ class GUI:
                     self.filtered = self.games.copy()
                     if self.games:
                         self.display()
-                        self.status.config(text=f"✅ Loaded {len(self.games)} games from cache", fg="#10b981")
+                        self.status.config(text=f"Loaded {len(self.games)} games from cache", fg="#10b981")
         except Exception:
             pass
 
@@ -1859,7 +2711,7 @@ class GUI:
         # Check if there's a pending update
         if not hasattr(self, 'pending_update'):
             # Manual check
-            self.status.config(text="🔍 Checking for updates...", fg="#60a5fa")
+            self.status.config(text="Checking for updates...", fg="#60a5fa")
             
             def check_and_show():
                 update_info = self.updater.check_for_updates()
@@ -1869,7 +2721,7 @@ class GUI:
                         self.pending_update = update_info # type: ignore
                         self._display_update_dialog(update_info)
                     else:
-                        self.status.config(text=f"✅ You're on the latest version (v{APP_VERSION})", fg="#10b981")
+                        self.status.config(text=f"You're on the latest version (v{APP_VERSION})", fg="#10b981")
                         messagebox.showinfo("No Updates", f"You're already running the latest version!\n\nCurrent version: v{APP_VERSION}")
                 
                 self.root.after(0, show_result)
@@ -1879,33 +2731,68 @@ class GUI:
             self._display_update_dialog(self.pending_update) # type: ignore
     
     def _display_update_dialog(self, update_info):
-        """Display the actual update dialog"""
+        """Display the actual update dialog with smooth styling"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Update Available")
-        dialog.geometry("700x700")
-        dialog.resizable(False, False)  # Disable resizing
-        dialog.configure(bg="#0f1629")
+        dialog.geometry("750x750")
+        dialog.resizable(False, False)
+        dialog.configure(bg=self.colors['bg_dark'])
         dialog.transient(self.root)
         dialog.grab_set()
         
-        # Header
-        tk.Label(dialog, text="🎉 Update Available!", font=("Segoe UI", 16, "bold"), bg="#0f1629", fg="#10b981").pack(pady=15)
+        # Smooth header with accent color
+        header = tk.Frame(dialog, bg=self.colors['accent_green'], height=110)
+        header.pack(fill="x")
+        header.pack_propagate(False)
         
-        # Version info
-        version_frame = tk.Frame(dialog, bg="#0f1629")
-        version_frame.pack(pady=8)
-        tk.Label(version_frame, text=f"Current: v{APP_VERSION}", font=("Segoe UI", 10), bg="#0f1629", fg="#9ca3af").pack()
-        tk.Label(version_frame, text=f"New: v{update_info['version']}", font=("Segoe UI", 12, "bold"), bg="#0f1629", fg="#10b981").pack()
+        tk.Label(header, text="Update Available", font=("Segoe UI", 22, "bold"),
+                bg=self.colors['accent_green'], fg=self.colors['text_primary']).pack(expand=True)
         
-        # Release notes
-        tk.Label(dialog, text="📝 What's New:", font=("Segoe UI", 11, "bold"), bg="#0f1629", fg="#ffffff").pack(pady=(15, 8))
+        # Version info container
+        version_container = tk.Frame(dialog, bg=self.colors['bg_card'],
+                                    highlightthickness=0)
+        version_container.pack(pady=25, padx=50, fill="x")
         
-        notes_frame = tk.Frame(dialog, bg="#1a1f3a", highlightthickness=1, highlightbackground="#2a2f4a")
-        notes_frame.pack(fill="both", expand=True, padx=25, pady=(0, 15))
+        version_frame = tk.Frame(version_container, bg=self.colors['bg_card'])
+        version_frame.pack(pady=20)
         
-        notes_text = tk.Text(notes_frame, font=("Segoe UI", 9), bg="#1a1f3a", fg="#e5e7eb", 
-                            wrap="word", relief="flat", padx=12, pady=12, height=8)
-        notes_scrollbar = tk.Scrollbar(notes_frame, command=notes_text.yview)
+        # Current and new version side by side
+        current_frame = tk.Frame(version_frame, bg=self.colors['bg_card'])
+        current_frame.pack(side="left", padx=25)
+        tk.Label(current_frame, text="Current Version",
+                font=("Segoe UI", 10), bg=self.colors['bg_card'],
+                fg=self.colors['text_secondary']).pack()
+        tk.Label(current_frame, text=f"v{APP_VERSION}",
+                font=("Segoe UI", 16, "bold"), bg=self.colors['bg_card'],
+                fg=self.colors['text_primary']).pack()
+        
+        tk.Label(version_frame, text="→", font=("Segoe UI", 20),
+                bg=self.colors['bg_card'], fg=self.colors['accent_blue']).pack(side="left", padx=15)
+        
+        new_frame = tk.Frame(version_frame, bg=self.colors['bg_card'])
+        new_frame.pack(side="left", padx=25)
+        tk.Label(new_frame, text="New Version",
+                font=("Segoe UI", 10), bg=self.colors['bg_card'],
+                fg=self.colors['text_secondary']).pack()
+        tk.Label(new_frame, text=f"v{update_info['version']}",
+                font=("Segoe UI", 16, "bold"), bg=self.colors['bg_card'],
+                fg=self.colors['accent_green']).pack()
+        
+        # Release notes section
+        tk.Label(dialog, text="What's New", font=("Segoe UI", 14, "bold"),
+                bg=self.colors['bg_dark'], fg=self.colors['text_primary']).pack(pady=(20, 12))
+        
+        notes_container = tk.Frame(dialog, bg=self.colors['bg_card'],
+                                  highlightthickness=0)
+        notes_container.pack(fill="both", expand=True, padx=50, pady=(0, 25))
+        
+        notes_text = tk.Text(notes_container, font=("Segoe UI", 10),
+                           bg=self.colors['bg_card'], fg=self.colors['text_secondary'],
+                           wrap="word", relief="flat", padx=18, pady=18, height=10)
+        notes_scrollbar = tk.Scrollbar(notes_container, command=notes_text.yview,
+                                      bg=self.colors['bg_dark'],
+                                      troughcolor=self.colors['bg_medium'],
+                                      activebackground=self.colors['text_secondary'])
         notes_text.config(yscrollcommand=notes_scrollbar.set)
         notes_scrollbar.pack(side="right", fill="y")
         notes_text.pack(side="left", fill="both", expand=True)
@@ -1916,21 +2803,25 @@ class GUI:
         notes_text.config(state="disabled")
         
         # Status label
-        status_label = tk.Label(dialog, text="", font=("Segoe UI", 9), bg="#0f1629", fg="#60a5fa")
-        status_label.pack(pady=8)
+        status_label = tk.Label(dialog, text="", font=("Segoe UI", 10),
+                               bg=self.colors['bg_dark'], fg=self.colors['accent_blue'])
+        status_label.pack(pady=12)
         
-        # Buttons
-        btn_frame = tk.Frame(dialog, bg="#0f1629")
-        btn_frame.pack(pady=15)
+        # Buttons with smooth styling
+        btn_frame = tk.Frame(dialog, bg=self.colors['bg_dark'])
+        btn_frame.pack(pady=25)
         
         def install_update():
             if not update_info.get('download_url'):
-                messagebox.showerror("Error", "No download URL available for this update.")
+                self.show_modern_dialog(
+                    "Error",
+                    "No download URL available for this update.",
+                    "error"
+                )
                 return
             
-            # Disable buttons during download
-            install_btn.config(state="disabled")
-            later_btn.config(state="disabled")
+            install_btn.config(state="disabled", bg=self.colors['bg_medium'])
+            later_btn.config(state="disabled", bg=self.colors['bg_medium'])
             
             def update_callback(message):
                 status_label.config(text=message)
@@ -1942,30 +2833,32 @@ class GUI:
                 )
                 
                 if success:
-                    # Installer will handle closing and restarting
                     def close_app():
-                        status_label.config(text="✅ Update will install shortly...")
+                        status_label.config(text="Update will install shortly...",
+                                          fg=self.colors['accent_green'])
                         self.root.after(2000, lambda: self.quit_app())
                     self.root.after(0, close_app)
                 else:
                     def re_enable():
-                        install_btn.config(state="normal")
-                        later_btn.config(state="normal")
-                        status_label.config(text="❌ Update failed. Please try again.", fg="#ef4444")
+                        install_btn.config(state="normal", bg=self.colors['accent_green'])
+                        later_btn.config(state="normal", bg=self.colors['bg_card'])
+                        status_label.config(text="Update failed. Please try again.",
+                                          fg=self.colors['accent_red'])
                     self.root.after(0, re_enable)
             
             threading.Thread(target=do_install, daemon=True).start()
         
-        install_btn = tk.Button(btn_frame, text="⬇️ Install Update", command=install_update, 
-                               font=("Segoe UI", 10, "bold"), bg="#10b981", fg="#ffffff", 
-                               activebackground="#059669", relief="flat", padx=25, pady=8, 
-                               cursor="hand2", borderwidth=0)
-        install_btn.pack(side="left", padx=4)
+        install_btn = tk.Button(btn_frame, text="Install Update", command=install_update,
+                               font=("Segoe UI", 12, "bold"), bg=self.colors['accent_green'],
+                               fg=self.colors['text_primary'], activebackground="#059669",
+                               relief="flat", padx=32, pady=14, cursor="hand2", borderwidth=0)
+        install_btn.pack(side="left", padx=7)
         
-        later_btn = tk.Button(btn_frame, text="Later", command=dialog.destroy, 
-                             font=("Segoe UI", 10), bg="#374151", fg="#ffffff", 
-                             relief="flat", padx=25, pady=8, cursor="hand2", borderwidth=0)
-        later_btn.pack(side="left", padx=4)
+        later_btn = tk.Button(btn_frame, text="Later", command=dialog.destroy,
+                             font=("Segoe UI", 11), bg=self.colors['bg_card'],
+                             fg=self.colors['text_primary'], relief="flat",
+                             padx=32, pady=14, cursor="hand2", borderwidth=0)
+        later_btn.pack(side="left", padx=7)
         
         # View on GitHub button
         if update_info.get('html_url'):
@@ -1973,20 +2866,29 @@ class GUI:
                 import webbrowser
                 webbrowser.open(update_info['html_url'])
             
-            tk.Button(btn_frame, text="View on GitHub", command=open_github, 
-                     font=("Segoe UI", 8), bg="#1f2937", fg="#9ca3af", 
-                     relief="flat", padx=18, pady=6, cursor="hand2", borderwidth=0).pack(side="left", padx=4)
+            tk.Button(btn_frame, text="View on GitHub", command=open_github,
+                     font=("Segoe UI", 10), bg=self.colors['bg_medium'],
+                     fg=self.colors['text_secondary'], relief="flat",
+                     padx=22, pady=12, cursor="hand2", borderwidth=0).pack(side="left", padx=7)
 
     def on_closing(self):
         """Fallback for non-tray systems, or if tray fails."""
         if self.monitor and self.monitor.active:
-            if messagebox.askyesno("Monitor Active", "Game monitor is active. Exit anyway?\n\nThis will stop tracking your games."):
-                self.monitor.stop()
-                self.root.destroy()
+            def on_confirm(result):
+                if result:
+                    self.monitor.stop() # type: ignore
+                    self.root.destroy()
+            
+            self.show_modern_dialog(
+                "Monitor Active",
+                "Game monitor is active. Exit anyway?\n\nThis will stop tracking your games.",
+                "question",
+                on_confirm
+            )
         else:
             self.root.destroy()
 
-# ---------- entrypoint ----------
+# Application Entry Point
 def main():
     root = tk.Tk()
     app = GUI(root)
